@@ -1,0 +1,3 @@
+import "std.io" as io
+use "std.text" as text
+let result = io.write(text.format(1, 2))[0].value

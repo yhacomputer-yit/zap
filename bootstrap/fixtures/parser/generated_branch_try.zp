@@ -1,0 +1,9 @@
+if ready:
+    say "yes"
+else:
+    say "no"
+try:
+    let value = compute(1, 2)
+    say value
+catch error:
+    say error

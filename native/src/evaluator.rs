@@ -874,6 +874,17 @@ fn direct_builtin_with_context_inner(
                 values.get(key).cloned().unwrap_or_else(|| args[2].clone()),
             ))
         }
+        "map_set" => {
+            expect(3)?;
+            let (Value::Map(values), Value::Text(key)) = (&args[0], &args[1]) else {
+                return Err("map_set expects a map, text key, and value".into());
+            };
+            let mut updated = values.clone();
+            updated.insert(key.clone(), args[2].clone());
+            let result = Value::Map(updated);
+            result.validate_memory_limits()?;
+            Ok(Some(result))
+        }
         "keys" => {
             expect(1)?;
             match &args[0] {
@@ -6136,6 +6147,62 @@ mod tests {
         let error = value_to_json(&value).unwrap_err();
         assert!(error.contains("json encode failed: value graph exceeds"));
         assert!(error.ends_with("levels"));
+    }
+
+    #[test]
+    fn map_set_builtin_updates_without_json_round_trip() {
+        let mut original = HashMap::new();
+        original.insert("count".into(), Value::Number(1));
+        let updated = direct_builtin(
+            "map_set",
+            vec![
+                Value::Map(original.clone()),
+                Value::Text("count".into()),
+                Value::Number(2),
+            ],
+        )
+        .expect("map_set should succeed")
+        .expect("map_set should return a value");
+        assert_eq!(original.get("count"), Some(&Value::Number(1)));
+        let Value::Map(updated) = updated else {
+            panic!("map_set should return a map");
+        };
+        assert_eq!(updated.get("count"), Some(&Value::Number(2)));
+        let inserted = direct_builtin(
+            "map_set",
+            vec![
+                Value::Map(updated.clone()),
+                Value::Text("added".into()),
+                Value::Text("ok".into()),
+            ],
+        )
+        .expect("map_set insertion should succeed")
+        .expect("map_set insertion should return a value");
+        let Value::Map(inserted) = inserted else {
+            panic!("map_set insertion should return a map");
+        };
+        assert_eq!(inserted.get("added"), Some(&Value::Text("ok".into())));
+        let nested_key = "quoted\"key,[]";
+        let nested_value = Value::List(vec![Value::Map({
+            let mut nested = HashMap::new();
+            nested.insert("inner".into(), Value::Number(9));
+            nested
+        })]);
+        let nested_result = direct_builtin(
+            "map_set",
+            vec![
+                Value::Map(inserted.clone()),
+                Value::Text(nested_key.into()),
+                nested_value.clone(),
+            ],
+        )
+        .expect("map_set JSON-sensitive insertion should succeed")
+        .expect("map_set JSON-sensitive insertion should return a value");
+        assert_eq!(inserted.get(nested_key), None);
+        let Value::Map(nested_result) = nested_result else {
+            panic!("map_set JSON-sensitive insertion should return a map");
+        };
+        assert_eq!(nested_result.get(nested_key), Some(&nested_value));
     }
 
     #[test]

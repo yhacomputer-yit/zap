@@ -1,0 +1,13 @@
+fn add(left, right):
+    return left + right
+
+class Box extends Base:
+    let value = 1
+    let label = "box"
+    fn get(self):
+        return self.value
+    fn set(self, next):
+        return next
+
+fn finish(value):
+    return add(value, 1)

@@ -12,7 +12,7 @@ import "bootstrap/b2/typed_ir.zp"
 let a = from_json(emit("raise \"bad\"", "raise.zp"))
 let b = from_json(emit("import std.io", "import.zp"))
 let c = from_json(emit("module demo", "module.zp"))
-let d = from_json(emit("try:", "try.zp"))
+let d = from_json(emit("try:\n    raise \"bad\"\ncatch:\n    say \"caught\"\n", "try.zp"))
 let e = from_json(emit("catch:", "catch.zp"))
 say a["ir"]["nodes"][0]["kind"]
 say b["ir"]["nodes"][0]["kind"]
@@ -24,8 +24,8 @@ cat > "$expected" <<'EOF'
 raise
 import
 module
-try
-catch
+try_catch
+invalid_statement
 EOF
 cargo run --quiet --release --locked --manifest-path native/Cargo.toml -- "$runner" > "$out"
 cmp "$out" "$expected"

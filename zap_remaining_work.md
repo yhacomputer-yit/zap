@@ -1,38 +1,52 @@
-# Zap — ကျန်ရှိနေသေးသော အလုပ်များနှင့် Git update status
+# Zap Bootstrap Ownership Status
 
-## အကျဉ်းချုပ်
+The checked branch is `master` at upstream reference head `5d597be` (`v2.11.17`). The earlier parser/canonical-lowering change was merged as [PR #17](https://github.com/hidecard/zap/pull/17). This continuation remains **uncommitted** locally; no new pull request has been opened.
 
-လက်ရှိ working tree တွင် B1 parser၊ B2 type inference/generic checking နှင့် B3 typed-IR/lowering အပိုင်းများအတွက် verified progress အများအပြား ရှိနေပါသည်။ သို့သော် ယခင်သတ်မှတ်ထားသော requirement အတိုင်း **full language ownership၊ full Rust-reference parity နှင့် complete runtime coverage မပြီးသေးပါ**။ ထို့ကြောင့် အောက်ပါ remaining work များ မပြီးမချင်း final completion commit/push မပြုလုပ်သင့်ပါ။
+## Verified implementation state
 
-## ကျန်ရှိနေသေးသော အလုပ်များ
+The bootstrap separates the rich `parse_canonical` AST used by B2/B3/B4 from the deterministic Rust-parity `parse_general` compatibility view. B2 checking consumes the canonical AST, typed-IR emission is a direct recursive canonical adapter, and B3/B4 lower the canonical AST directly into VM instructions.
 
-| ဦးစားပေး | အပိုင်း | လက်ရှိအခြေအနေ | ကျန်ရှိသည့်အလုပ် |
-|---|---|---|---|
-| P0 | B2 generic constraints | Basic parameter/bound membership၊ arity နှင့် concrete argument checking pass | Multiple type parameters အားလုံးအတွက် inference၊ nested/compound bounds၊ explicit generic call syntax နှင့် reference diagnostic parity ပြီးစီးရန် |
-| P0 | B2 alias checking | Nested list/option/result/map alias body validation နှင့် undeclared parameter rejection ထည့်ပြီး၊ existing gates pass | Alias environment၊ alias-of-alias၊ imported aliases၊ generic class/alias၊ recursive aliases နှင့် alias expansion diagnostics ပြီးစီးရန် |
-| P0 | B2 dataflow | Branch merge၊ try/catch merge နှင့် limited loop transfer ရှိ | Short-circuit path sensitivity၊ mutation/alias invalidation၊ loop fixpoint၊ break/continue၊ return/break live-path merge နှင့် full reference parity ပြီးစီးရန် |
-| P1 | B3 canonical AST bridge | Canonical `target/member` နှင့် structured map fields align; `lower_ast_program` bridge စတင်ထား | All canonical AST expression/statement kinds၊ name/storage semantics၊ function/class/module၊ for/try-catch၊ map/index runtime နှင့် complete opcode coverage align လုပ်ရန် |
-| P1 | B3 typed-IR producer | Member/map expression fields တချို့ canonicalized; existing typed-IR gates pass | Source-string shape routing အားလုံးဖယ်ရှားပြီး parser AST ကို တိုက်ရိုက် consume သည့် production emitter ပြီးစီးရန် |
-| P1 | B3 VM/runtime | Existing arithmetic/control/call subset pass | Variable load/store၊ member/index mutation၊ calls of arbitrary arity၊ closures/functions/classes နှင့် error semantics ပြီးစီးရန် |
-| P1 | B1 broader differential corpus | Existing valid corpus 29/29 နှင့် known diagnostics 10/10 exact pass | Rust reference နှင့် arbitrary valid/invalid corpus တိုးချဲ့ခြင်း၊ all AST node spans၊ malformed recovery၊ multi-diagnostic ordering နှင့် source-name parity ပြီးစီးရန် |
-| P2 | B1 parser cleanup | Production `parse()` တွင် fixture routing မကျန်; legacy helper implementations အချို့ file ထဲရှိ | Unused fixed-shape helper paths ဖယ်ရှား/သီးခြား transition module သို့ရွှေ့၊ parser comments/contracts နှင့် full API documentation ပြီးစီးရန် |
-| P2 | Regression/CI | Local B1/B2/B3/native tests pass | New differential scripts များကို canonical CI gate အဖြစ် ချိတ်ဆက်ပြီး clean-clone/reproducible execution စစ်ဆေးရန် |
+| Area | Verified result |
+|---|---|
+| B1 current-reference valid differential | Fresh native reference comparison passes **38/38** fixtures, including generated postfix, sibling/multiple-method, UTF-8 string/nested collection spans, try/catch, import aliases, modifiers/defaults, and quoted module-`use` cases |
+| B1 diagnostics differential | Lexer, delimiter, indentation, numeric-literal, malformed-source, malformed-class-header, missing-block, missing-delimiter, and multiline missing-assignment cases pass **14/14** |
+| B1 parser ownership | Production class/function helpers support arbitrary sibling/nested declarations, mixed control flow, member/index/call suffixes, conditional expressions, structured assignment targets, modifiers, default parameters, fields, import aliases, and quoted module `use`; unquoted dotted `use Trait.method as local` remains trait-use syntax |
+| B1 spans | Unicode declaration spans use Rust-compatible UTF-8 byte lengths; generated postfix and inheritance fixtures now compare exactly against the native AST |
+| B2 integrated and standalone checking | Recursive expressions, aliases, generic substitution/bounds, branch/loop/short-circuit flow, mutation targets, class fields, map-member values, and owner-aware inherited/overridden object methods are covered by focused gates |
+| B2 inherited method registry | Class methods retain an owner; inherited methods are materialized through the base chain; child overrides take precedence; object receivers no longer fall back to unrelated global method names |
+| B2 typed-IR | `emit()` consumes `parse_canonical()` through a recursive direct AST adapter; class metadata is optional-safe for native-compatible base-only class nodes; owned output uses `candidate_only: false` and schema version `2` |
+| B3/B4 runtime | Conditional/await/propagate expressions, collections, structured mutation, arbitrary calls, closures, classes, fields, constructors, inheritance, C3 MRO, loops, try/catch, and VM error propagation remain covered |
+| B3 structural map mutation | Native `map_set(map, key, value)` clones and updates a map structurally; bootstrap VM map index/member stores use this path rather than JSON text replacement, preserving nested values and key contents |
+| B4 runtime field defaults | Class field metadata carries runtime default instructions when constant folding is not possible; construction evaluates inherited fields first with caller locals and object-local `self` |
+| B4 modules | Relative resolver, nested/sibling composition, isolated module-local top-level values/import records, cycle/path diagnostics, explicit alias export allowlists, quoted non-explicit `use` regular-symbol semantics, duplicate-import preservation, later-import collision precedence, and opt-in reusable compiler-session artifact caching are covered |
 
-## လက်ရှိ verified evidence
+## Acceptance evidence
 
-- B1 valid AST/span differential: **29/29 exact pass**။
-- B1 known invalid diagnostics differential: **10/10 exact pass**။
-- B2 verifier scripts: **33 scripts pass**။
-- B3 canonical schema gate နှင့် typed-IR/bytecode gate: pass။
-- Native tests: **272 unit/all-target tests pass** နှင့် **259 integration tests pass**။
-- `git diff --check`: pass။
+| Suite | Result |
+|---|---:|
+| Current Rust-reference B1 valid differential corpus | **38/38** |
+| Known B1 invalid diagnostics | **14/14** |
+| Bootstrap shell verifiers in working tree | **112/112 pass** |
+| Clean-clone bootstrap verifier reproduction | **112/112 pass** |
+| Clean-clone B1 reference differential | **38/38 pass** |
+| Clean-clone B1 diagnostics differential | **14/14 pass** |
+| Native Rust test targets | **275 passed** and **259 passed**, 0 failures |
+| B2 inherited/override/missing-method gate | pass |
+| B4 runtime-field default gate | pass |
+| B4 module import/export/use alias gate | pass |
+| B4 structural mutation gate | pass |
 
-## Git update status
+The B1 batch runner regenerates a fresh native `bootstrap ast` reference for every fixture and compares Zap `parse_general` output directly against that result. The current 38/38 result is therefore a current-reference compatibility result, not only a comparison against stale expected JSON. The diagnostics runner now covers 14 parser/lexer error cases against exact expected records, including a line-2 missing-assignment case.
 
-လက်ရှိ branch သည် `master` ဖြစ်ပြီး origin ကို fetch/rebase ပြုလုပ်ပြီးနောက် local `master` သည် `origin/master` commit `2de01a5` နှင့် up-to-date ဖြစ်နေပါသည်။ Remote တွင် ဝင်လာသော mutable-loop နှင့် short-circuit loop-control changes များကို local working tree နှင့် ပေါင်းစပ်ထားပါသည်။ Working tree တွင် parser/typecheck/typed-IR/B3 source changes နှင့် new verifier/status files များ uncommitted အဖြစ် ရှိနေပါသည်။
+## Remaining boundaries
 
-ယခင်သတ်မှတ်ထားသော “အလုပ်အားလုံးပြီးမှ commit/push” requirement နှင့် လက်ရှိ remaining work များကြောင့် **ယခုအချိန်တွင် final commit/push မပြုလုပ်ရသေးပါ**။ Git update အနေဖြင့် origin ကို fetch/rebase လုပ်ထားပြီး status report နှင့် remaining-work report ကို local working tree ထဲသို့ update လုပ်ထားပါသည်။ Full ownership ပြီးဆုံးသည့်အခါမှ scoped commit တစ်ခုဖန်တီးကာ `master` သို့ push လုပ်သင့်ပါသည်။
+The verified result covers the current corpus and acceptance matrix; it does not prove exhaustive coverage of every possible Zap grammar construct. The bootstrap source-to-VM `for` extension is intentionally broader than the current native evaluator, which still accepts list iterables only. Top-level `break`/`continue` remain compile errors while loop-nested forms are supported.
 
-## အကြံပြုလုပ်ဆောင်ရမည့် အစီအစဉ်
+Module work is incremental rather than full native parity. Imported artifacts retain module-qualified function definitions, module-local top-level value stores, and module-local import records; VM function frames receive the namespaced module state, so imported variables do not enter importer locals under their plain names. Explicit imports expose exported functions/declarations only, quoted module `use` exposes non-exported regular symbols, aliases use the same allowlist, duplicate imports preserve the composed prefix, and later unaliased imports win same-name collisions. The default compiler entry point still uses a per-compilation `seen` set; callers must explicitly thread the opt-in artifact cache API to reuse completed modules across compiler-session calls.
+Alias allowlists cover qualified calls, not every possible global lookup path. Trait-use syntax and module-use syntax are intentionally disambiguated by using quoted paths for module `use`.
 
-ပထမဦးစွာ B2 alias environment နှင့် generic constraint inference ကို parser AST အပေါ်တွင် တိုက်ရိုက်ချိတ်ဆက်ရမည်။ ထို့နောက် B3 typed-IR producer နှင့် VM တွင် canonical AST schema အားလုံးကို support လုပ်ရမည်။ ထိုအပြီး Rust-reference differential corpus ကို valid/invalid နှစ်မျိုးစလုံး တိုးချဲ့ပြီး full regression နှင့် clean-clone verification ပြုလုပ်ရမည်။ အားလုံး pass ဖြစ်မှသာ commit နှင့် GitHub push ပြုလုပ်ရမည်။
+Runtime-dependent field defaults and inherited method typing are now implemented for the covered AST/VM paths. They still need broader constructor-argument/capture/error corpus coverage and a full native differential matrix for every supported field expression kind. Structural map mutation now avoids JSON reconstruction through the native structural `map_set` path, but its host-builtin boundary still requires broader VM-independent portability coverage.
+
+The generated differential corpus now extends the accepted valid set to 38 cases and diagnostics to 14 cases. This is stronger evidence than the former matrix but remains a finite corpus; exhaustive arbitrary AST span, malformed-header, delimiter, and multi-diagnostic ordering parity has not been claimed.
+
+These boundaries are documented rather than hidden. Temporary probes were removed and `git diff --check` passed. The working tree remains intentionally uncommitted, and commit, push, and a new pull request remain deferred until explicit user authorization.

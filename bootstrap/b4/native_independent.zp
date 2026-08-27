@@ -601,14 +601,308 @@ export fn seed_compile_typed_ir(ir, source_name):
         return {"artifact_kind": "bytecode", "error": lowered["error"], "instructions": [], "native_independent": false, "source_name": source_name, "status": "compile_error"}
     return {"artifact_kind": "bytecode", "instructions": lowered["instructions"], "native_independent": false, "source_name": source_name, "status": "compiled_typed_ir_slice"}
 
+export fn seed_module_candidate(path):
+    if ends_with(path, ".zp"):
+        return path
+    return path + ".zp"
+
+export fn seed_module_resolve(source_name, raw_path):
+    let requested = trim(raw_path)
+    if requested == "":
+        return {"error": "import expects a module path", "path": ""}
+    if starts_with(requested, "/") or contains(requested, ".."):
+        return {"error": "invalid module path: " + requested, "path": ""}
+    let base = dirname(source_name)
+    let joined = path_join(base, requested)
+    let candidate = seed_module_candidate(joined)
+    if exists(candidate):
+        return {"error": none, "path": candidate}
+    if exists(joined):
+        return {"error": none, "path": joined}
+    return {"error": "module not found: " + requested, "path": ""}
+
+export fn seed_module_seen(paths, path):
+    for item in paths:
+        if item == path:
+            return true
+    return false
+
+export fn seed_module_symbols(statements, explicit, result):
+    let symbols = result
+    for statement in statements:
+        if statement["kind"] == "function" or statement["kind"] == "declaration":
+            let exported = contains(json(statement), "\"exported\":true")
+            if explicit and exported:
+                symbols = append(symbols, statement["name"])
+            if not explicit and not exported:
+                symbols = append(symbols, statement["name"])
+    return symbols
+
+export fn seed_module_symbols_from_file(path, explicit):
+    let parsed = from_json(parse_canonical(read_text(path), path))
+    if parsed["kind"] != "zap.ast":
+        return {"error": "cannot parse module: " + path, "symbols": []}
+    return {"error": none, "symbols": seed_module_symbols(parsed["ast"]["statements"], explicit, [])}
+
+export fn seed_annotate_alias_imports(statements, source_name, index, result):
+    if index >= len(statements):
+        return {"error": none, "statements": result}
+    let statement = statements[index]
+    if statement["kind"] == "import":
+        let resolved = seed_module_resolve(source_name, statement["path"])
+        if resolved["error"] != none:
+            return {"error": resolved["error"], "statements": []}
+        let symbols = seed_module_symbols_from_file(resolved["path"], statement["explicit"])
+        if symbols["error"] != none:
+            return {"error": symbols["error"], "statements": []}
+        let alias = none
+        if contains(json(statement), "\"alias\""):
+            alias = statement["alias"]
+        let annotated = {"alias": alias, "explicit": statement["explicit"], "kind": "import", "module_path": resolved["path"], "path": statement["path"], "span": statement["span"], "symbols": symbols["symbols"]}
+        return seed_annotate_alias_imports(statements, source_name, index + 1, append(result, annotated))
+    return seed_annotate_alias_imports(statements, source_name, index + 1, append(result, statement))
+
+export fn seed_module_import_paths(statements, source_name, index, result):
+    if index >= len(statements):
+        return result
+    let statement = statements[index]
+    if statement["kind"] == "import":
+        let resolved = seed_module_resolve(source_name, statement["path"])
+        if resolved["error"] == none:
+            let symbols = []
+            if contains(json(statement), "\"symbols\""):
+                symbols = statement["symbols"]
+            result = append(result, {"path": resolved["path"], "symbols": symbols})
+    return seed_module_import_paths(statements, source_name, index + 1, result)
+
+export fn seed_strip_module_imports_at(instructions, index, result, removed):
+    if index >= len(instructions):
+        return result
+    let instruction = instructions[index]
+    if instruction["op"] == "module_import":
+        return seed_strip_module_imports_at(instructions, index + 1, result, removed + 1)
+    let rebased = b3_rebase_targets([instruction], 0 - removed)
+    return seed_strip_module_imports_at(instructions, index + 1, append(result, rebased[0]), removed)
+
+export fn seed_strip_module_imports(instructions, index, result):
+    return seed_strip_module_imports_at(instructions, index, result, 0)
+
+export fn seed_rewrite_module_imports(instructions, module_path, index, result):
+    if index >= len(instructions):
+        return result
+    let instruction = instructions[index]
+    if instruction["op"] == "module_import":
+        instruction = {"imported_path": instruction["module_path"], "module_path": module_path, "op": "module_import_local", "symbols": instruction["symbols"]}
+    return seed_rewrite_module_imports(instructions, module_path, index + 1, append(result, instruction))
+
+export fn seed_store_inside_function(instructions, target_index, index):
+    if index >= len(instructions):
+        return false
+    let instruction = instructions[index]
+    if instruction["op"] == "function_def" and target_index >= instruction["entry"] and target_index < instruction["end"]:
+        return true
+    return seed_store_inside_function(instructions, target_index, index + 1)
+
+export fn seed_mark_module_instructions(instructions, module_path, imports, index, result):
+    if index >= len(instructions):
+        return result
+    let instruction = instructions[index]
+    if instruction["op"] == "function_def" and not contains(json(instruction), "\"module_path\""):
+        let required = false
+        if contains(json(instruction), "\"required\":true"):
+            required = true
+        instruction = {"binding": instruction["binding"], "captures": instruction["captures"], "end": instruction["end"], "entry": instruction["entry"], "imports": imports, "module_path": module_path, "name": instruction["name"], "op": "function_def", "owner": instruction["owner"], "params": instruction["params"], "required": required}
+    if instruction["op"] == "store" and not seed_store_inside_function(instructions, index, 0):
+        instruction = {"module_path": module_path, "name": instruction["name"], "op": "module_store"}
+    return seed_mark_module_instructions(instructions, module_path, imports, index + 1, append(result, instruction))
+
+export fn seed_module_chain(paths, index, result):
+    if index >= len(paths):
+        return result
+    if result == "":
+        return seed_module_chain(paths, index + 1, paths[index])
+    return seed_module_chain(paths, index + 1, result + " -> " + paths[index])
+
+export fn seed_module_cache_lookup(cache, path, index):
+    if index >= len(cache):
+        return none
+    if cache[index]["path"] == path:
+        return cache[index]
+    return seed_module_cache_lookup(cache, path, index + 1)
+
+export fn seed_module_imports_cached(statements, source_name, seen, loading, prefix, cache):
+    let result = {"cache": cache, "error": none, "instructions": prefix, "seen": seen}
+    for statement in statements:
+        if statement["kind"] == "import":
+            let resolved = seed_module_resolve(source_name, statement["path"])
+            if resolved["error"] != none:
+                return {"cache": result["cache"], "error": resolved["error"], "instructions": [], "seen": result["seen"]}
+            let module_result = seed_module_file_cached(resolved["path"], result["seen"], loading, result["cache"])
+            if module_result["error"] != none:
+                return module_result
+            let shifted = b3_rebase_targets(module_result["instructions"], len(result["instructions"]))
+            result = {"cache": module_result["cache"], "error": none, "instructions": seed_append_all(result["instructions"], shifted), "seen": module_result["seen"]}
+        if statement["kind"] == "function" or statement["kind"] == "class" or statement["kind"] == "trait" or statement["kind"] == "interface":
+            let nested = seed_module_imports_cached(statement["body"]["statements"], source_name, result["seen"], loading, result["instructions"], result["cache"])
+            if nested["error"] != none:
+                return nested
+            result = nested
+        if statement["kind"] == "if":
+            let then_result = seed_module_imports_cached(statement["then_branch"]["statements"], source_name, result["seen"], loading, result["instructions"], result["cache"])
+            if then_result["error"] != none:
+                return then_result
+            result = then_result
+            if statement["else_branch"] != none:
+                let else_result = seed_module_imports_cached(statement["else_branch"]["statements"], source_name, result["seen"], loading, result["instructions"], result["cache"])
+                if else_result["error"] != none:
+                    return else_result
+                result = else_result
+        if statement["kind"] == "while" or statement["kind"] == "for":
+            let loop_result = seed_module_imports_cached(statement["body"]["statements"], source_name, result["seen"], loading, result["instructions"], result["cache"])
+            if loop_result["error"] != none:
+                return loop_result
+            result = loop_result
+        if statement["kind"] == "try_catch":
+            let try_result = seed_module_imports_cached(statement["body"]["statements"], source_name, result["seen"], loading, result["instructions"], result["cache"])
+            if try_result["error"] != none:
+                return try_result
+            let catch_result = seed_module_imports_cached(statement["catch_body"]["statements"], source_name, try_result["seen"], loading, try_result["instructions"], try_result["cache"])
+            if catch_result["error"] != none:
+                return catch_result
+            result = catch_result
+    return result
+
+export fn seed_module_file_cached(path, seen, loading, cache):
+    if seed_module_seen(loading, path):
+        return {"cache": cache, "error": "circular import detected: " + seed_module_chain(loading, 0, "") + " -> " + path, "instructions": [], "seen": seen}
+    if seed_module_seen(seen, path):
+        return {"cache": cache, "error": none, "instructions": [], "seen": seen}
+    let cached = seed_module_cache_lookup(cache, path, 0)
+    if cached != none:
+        return {"cache": cache, "error": none, "instructions": cached["instructions"], "seen": append(seen, path)}
+    let module_source = read_text(path)
+    let parsed = from_json(parse_canonical(module_source, path))
+    if parsed["kind"] != "zap.ast":
+        return {"cache": cache, "error": "cannot parse module: " + path, "instructions": [], "seen": seen}
+    let annotated = seed_annotate_alias_imports(parsed["ast"]["statements"], path, 0, [])
+    if annotated["error"] != none:
+        return {"cache": cache, "error": annotated["error"], "instructions": [], "seen": seen}
+    let imports = seed_module_imports_cached(annotated["statements"], path, seen, append(loading, path), [], cache)
+    if imports["error"] != none:
+        return imports
+    let lowered = lower_ast_block_with_prefix({"statements": annotated["statements"]}, imports["instructions"])
+    if lowered["error"] != none:
+        return {"cache": imports["cache"], "error": lowered["error"], "instructions": [], "seen": seen}
+    let import_paths = seed_module_import_paths(annotated["statements"], path, 0, [])
+    let rewritten = seed_rewrite_module_imports(lowered["instructions"], path, 0, [])
+    let marked = seed_mark_module_instructions(rewritten, path, import_paths, 0, [])
+    let artifact = {"instructions": marked, "path": path}
+    return {"cache": append(imports["cache"], artifact), "error": none, "instructions": marked, "seen": append(imports["seen"], path)}
+
+export fn seed_compile_ast_source_with_cache(source, source_name, cache):
+    let parsed = from_json(parse_canonical(source, source_name))
+    if parsed["kind"] != "zap.ast":
+        return {"artifact_kind": "bytecode", "cache": cache, "error": "parse_error", "instructions": [], "native_independent": false, "source_name": source_name, "status": "compile_error"}
+    let annotated = seed_annotate_alias_imports(parsed["ast"]["statements"], source_name, 0, [])
+    if annotated["error"] != none:
+        return {"artifact_kind": "bytecode", "cache": cache, "error": annotated["error"], "instructions": [], "native_independent": false, "source_name": source_name, "status": "compile_error"}
+    let modules = seed_module_imports_cached(annotated["statements"], source_name, [], [source_name], [], cache)
+    if modules["error"] != none:
+        return {"artifact_kind": "bytecode", "cache": modules["cache"], "error": modules["error"], "instructions": [], "native_independent": false, "source_name": source_name, "status": "compile_error"}
+    let lowered = lower_ast_block_with_prefix({"statements": annotated["statements"]}, modules["instructions"])
+    if lowered["error"] != none:
+        return {"artifact_kind": "bytecode", "cache": modules["cache"], "error": lowered["error"], "instructions": [], "native_independent": false, "source_name": source_name, "status": "compile_error"}
+    for instruction in lowered["instructions"]:
+        if instruction["op"] == "break_jump":
+            return {"artifact_kind": "bytecode", "cache": modules["cache"], "error": "unsupported_ast_statement:break", "instructions": [], "native_independent": false, "source_name": source_name, "status": "compile_error"}
+        if instruction["op"] == "continue_jump":
+            return {"artifact_kind": "bytecode", "cache": modules["cache"], "error": "unsupported_ast_statement:continue", "instructions": [], "native_independent": false, "source_name": source_name, "status": "compile_error"}
+    return {"artifact_kind": "bytecode", "cache": modules["cache"], "error": none, "instructions": append(lowered["instructions"], {"op": "halt"}), "native_independent": false, "source_name": source_name, "status": "compiled_ast_slice"}
+
+export fn seed_module_imports(statements, source_name, seen, loading, prefix):
+    let result = {"error": none, "instructions": prefix, "seen": seen}
+    for statement in statements:
+        if statement["kind"] == "import":
+            let resolved = seed_module_resolve(source_name, statement["path"])
+            if resolved["error"] != none:
+                return {"error": resolved["error"], "instructions": [], "seen": result["seen"]}
+            let module_result = seed_module_file(resolved["path"], result["seen"], loading, result["instructions"])
+            if module_result["error"] != none:
+                return module_result
+            result = {"error": none, "instructions": module_result["instructions"], "seen": module_result["seen"]}
+        if statement["kind"] == "function" or statement["kind"] == "class" or statement["kind"] == "trait" or statement["kind"] == "interface":
+            let nested = seed_module_imports(statement["body"]["statements"], source_name, result["seen"], loading, result["instructions"])
+            if nested["error"] != none:
+                return nested
+            result = {"error": none, "instructions": nested["instructions"], "seen": nested["seen"]}
+        if statement["kind"] == "if":
+            let then_result = seed_module_imports(statement["then_branch"]["statements"], source_name, result["seen"], loading, result["instructions"])
+            if then_result["error"] != none:
+                return then_result
+            result = {"error": none, "instructions": then_result["instructions"], "seen": then_result["seen"]}
+            if statement["else_branch"] != none:
+                let else_result = seed_module_imports(statement["else_branch"]["statements"], source_name, result["seen"], loading, result["instructions"])
+                if else_result["error"] != none:
+                    return else_result
+                result = {"error": none, "instructions": else_result["instructions"], "seen": else_result["seen"]}
+        if statement["kind"] == "while" or statement["kind"] == "for":
+            let loop_result = seed_module_imports(statement["body"]["statements"], source_name, result["seen"], loading, result["instructions"])
+            if loop_result["error"] != none:
+                return loop_result
+            result = {"error": none, "instructions": loop_result["instructions"], "seen": loop_result["seen"]}
+        if statement["kind"] == "try_catch":
+            let try_result = seed_module_imports(statement["body"]["statements"], source_name, result["seen"], loading, result["instructions"])
+            if try_result["error"] != none:
+                return try_result
+            let catch_result = seed_module_imports(statement["catch_body"]["statements"], source_name, try_result["seen"], loading, try_result["instructions"])
+            if catch_result["error"] != none:
+                return catch_result
+            result = {"error": none, "instructions": catch_result["instructions"], "seen": catch_result["seen"]}
+    return result
+
+export fn seed_module_file(path, seen, loading, prefix):
+    if seed_module_seen(loading, path):
+        return {"error": "circular import detected: " + seed_module_chain(loading, 0, "") + " -> " + path, "instructions": [], "seen": seen}
+    if seed_module_seen(seen, path):
+        return {"error": none, "instructions": prefix, "seen": seen}
+    let module_source = read_text(path)
+    let parsed = from_json(parse_canonical(module_source, path))
+    if parsed["kind"] != "zap.ast":
+        return {"error": "cannot parse module: " + path, "instructions": [], "seen": seen}
+    let annotated = seed_annotate_alias_imports(parsed["ast"]["statements"], path, 0, [])
+    if annotated["error"] != none:
+        return {"error": annotated["error"], "instructions": [], "seen": seen}
+    let next_loading = append(loading, path)
+    let imports = seed_module_imports(annotated["statements"], path, seen, next_loading, prefix)
+    if imports["error"] != none:
+        return imports
+    let lowered = lower_ast_block_with_prefix({"statements": annotated["statements"]}, imports["instructions"])
+    if lowered["error"] != none:
+        return {"error": lowered["error"], "instructions": [], "seen": seen}
+    let import_paths = seed_module_import_paths(annotated["statements"], path, 0, [])
+    let rewritten = seed_rewrite_module_imports(lowered["instructions"], path, 0, [])
+    let marked = seed_mark_module_instructions(rewritten, path, import_paths, 0, [])
+    return {"error": none, "instructions": marked, "seen": append(imports["seen"], path)}
+
 export fn seed_compile_ast_source(source, source_name):
-    let parsed = from_json(parse_general(source, source_name))
+    let parsed = from_json(parse_canonical(source, source_name))
     if parsed["kind"] != "zap.ast":
         return {"artifact_kind": "bytecode", "error": "parse_error", "instructions": [], "native_independent": false, "source_name": source_name, "status": "compile_error"}
-    let lowered = lower_ast_program(parsed)
+    let annotated = seed_annotate_alias_imports(parsed["ast"]["statements"], source_name, 0, [])
+    if annotated["error"] != none:
+        return {"artifact_kind": "bytecode", "error": annotated["error"], "instructions": [], "native_independent": false, "source_name": source_name, "status": "compile_error"}
+    let modules = seed_module_imports(annotated["statements"], source_name, [], [source_name], [])
+    if modules["error"] != none:
+        return {"artifact_kind": "bytecode", "error": modules["error"], "instructions": [], "native_independent": false, "source_name": source_name, "status": "compile_error"}
+    let lowered = lower_ast_block_with_prefix({"statements": annotated["statements"]}, modules["instructions"])
     if lowered["error"] != none:
         return {"artifact_kind": "bytecode", "error": lowered["error"], "instructions": [], "native_independent": false, "source_name": source_name, "status": "compile_error"}
-    return {"artifact_kind": "bytecode", "instructions": lowered["instructions"], "native_independent": false, "source_name": source_name, "status": "compiled_ast_slice"}
+    for instruction in lowered["instructions"]:
+        if instruction["op"] == "break_jump":
+            return {"artifact_kind": "bytecode", "error": "unsupported_ast_statement:break", "instructions": [], "native_independent": false, "source_name": source_name, "status": "compile_error"}
+        if instruction["op"] == "continue_jump":
+            return {"artifact_kind": "bytecode", "error": "unsupported_ast_statement:continue", "instructions": [], "native_independent": false, "source_name": source_name, "status": "compile_error"}
+    return {"artifact_kind": "bytecode", "instructions": append(lowered["instructions"], {"op": "halt"}), "native_independent": false, "source_name": source_name, "status": "compiled_ast_slice"}
 
 export fn seed_self_rebuild(source, source_name):
     let first = seed_compile_source(source, source_name)

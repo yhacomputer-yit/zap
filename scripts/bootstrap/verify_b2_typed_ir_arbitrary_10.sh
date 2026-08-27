@@ -13,24 +13,20 @@ let output = from_json(emit("if ready:\n    say \"yes\"\nwhile running:\n    ret
 let nodes = output["ir"]["nodes"]
 say len(nodes)
 say nodes[0]["kind"]
-say nodes[0]["successors"][0]
+say nodes[0]["then_branch"]["statements"][0]["kind"]
 say nodes[1]["kind"]
-say nodes[1]["span"]["line"]
+say nodes[1]["body"]["statements"][0]["kind"]
 say nodes[2]["kind"]
-say nodes[3]["kind"]
-say nodes[4]["kind"]
-say nodes[4]["successors"][0]
+say nodes[2]["body"]["statements"][0]["kind"]
 EOF
 cat > "$expected" <<'EOF'
-6
+3
 if
-2
 say
-2
 while
 return
 for
-6
+say
 EOF
 cargo run --quiet --release --locked --manifest-path native/Cargo.toml -- "$runner" > "$out"
 cmp "$out" "$expected"

@@ -1,0 +1,16 @@
+fn first(value):
+    return value
+
+fn second(value):
+    return value + 1
+
+class Base:
+    let value: number = 1
+    fn get(value):
+        return value
+    fn twice(value):
+        return value + value
+
+class Child(Base):
+    fn child(value):
+        return value

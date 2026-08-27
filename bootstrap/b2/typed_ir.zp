@@ -395,7 +395,7 @@ export fn typed_ir_trait_nodes(statements, result):
     return nodes
 
 export fn emit_trait_typed_ir(source, source_name):
-    let parsed = from_json(parse_general(source, source_name))
+    let parsed = from_json(parse_canonical(source, source_name))
     if parsed["kind"] != "zap.ast":
         return json({"candidate_only": true, "diagnostics": parsed["diagnostics"], "ir": {"nodes": []}, "kind": "zap.typed_ir", "schema_version": 2, "source_name": source_name})
     let nodes = typed_ir_trait_nodes(parsed["ast"]["statements"], [])
@@ -419,41 +419,111 @@ export fn emit_declarations(source, source_name):
             nodes = append(nodes, declaration_node(variable, annotation, inferred_type_for(expression), literal, line_number, len(value)))
     return json({"candidate_only": true, "ir": {"nodes": nodes}, "kind": "zap.typed_ir", "schema_version": 1, "source_name": source_name})
 
-export fn emit(source, source_name):
-    if contains(source, "\n") and starts_with(trim(source), "let "):
-        return emit_arbitrary_program(source, source_name)
-    if starts_with(trim(source), "if ") or starts_with(trim(source), "while ") or starts_with(trim(source), "for ") or starts_with(trim(source), "return") or starts_with(trim(source), "say ") or starts_with(trim(source), "raise ") or starts_with(trim(source), "import ") or starts_with(trim(source), "module ") or trim(source) == "try:" or starts_with(trim(source), "catch"):
+export fn typed_ir_inferred_type_node(node):
+    let kind = node["kind"]
+    if kind == "literal":
+        if node["literal_kind"] == "number":
+            return "number"
+        if node["literal_kind"] == "text":
+            return "text"
+        if node["literal_kind"] == "bool":
+            return "bool"
+        return "none"
+    if kind == "list":
+        if len(node["elements"]) == 0:
+            return "list<any>"
+        let element_type = typed_ir_inferred_type_node(node["elements"][0])
+        for item in node["elements"]:
+            if typed_ir_inferred_type_node(item) != element_type:
+                return "list<any>"
+        return "list<" + element_type + ">"
+    if kind == "map":
+        if len(node["entries"]) == 0:
+            return "map<any,any>"
+        let first = node["entries"][0]
+        return "map<" + typed_ir_inferred_type_node(first["key"]) + "," + typed_ir_inferred_type_node(first["value"]) + ">"
+    if kind == "binary":
+        if node["op"] == "equal" or node["op"] == "not_equal" or node["op"] == "less" or node["op"] == "less_equal" or node["op"] == "greater" or node["op"] == "greater_equal" or node["op"] == "and" or node["op"] == "or":
+            return "bool"
+        return typed_ir_inferred_type_node(node["left"])
+    if kind == "call":
+        if node["callee"]["kind"] == "name" and len(node["args"]) > 0:
+            let name = node["callee"]["name"]
+            if name == "identity" or name == "keep" or name == "first":
+                return typed_ir_inferred_type_node(node["args"][0]["value"])
+        return "any"
+    if kind == "index":
+        let target_type = typed_ir_inferred_type_node(node["target"])
+        if starts_with(target_type, "list<") and ends_with(target_type, ">"):
+            return substring(target_type, 5, len(target_type) - 1)
+        if starts_with(target_type, "map<") and ends_with(target_type, ">"):
+            let parts = split(substring(target_type, 4, len(target_type) - 1), ",")
+            if len(parts) == 2:
+                return parts[1]
+        return "any"
+    return "any"
 
-        return emit_arbitrary_program(source, source_name)
-    if starts_with(trim(source), "trait ") or starts_with(trim(source), "interface ") or contains(source, " with ") or contains(source, " implements "):
-        return emit_trait_typed_ir(source, source_name)
-    if starts_with(trim(source), "type "):
-        return emit_generic_type_aliases(source, source_name)
-    if source == "let first: number = 1\nlet label: text = \"zap\"\n":
-        let first_value = literal_node("number", 1, 1, 1, 1)
-        let label_value = literal_node("text", "zap", 1, 1, 5)
-        let first = declaration_node("first", "number", "number", first_value, 1, 21)
-        let label = declaration_node("label", "text", "text", label_value, 2, 23)
-        return json({"candidate_only": true, "ir": {"nodes": [first, label]}, "kind": "zap.typed_ir", "schema_version": 1, "source_name": source_name})
-    if source == "fn identity<T>(value: T) -> T:\n    return value\n\nlet numeric: number = identity(1)\nlet textual: text = identity(\"zap\")\n":
-        let function_node = {"body": {"statements": [{"kind": "return", "span": span(2, 5, 12), "value": {"kind": "name", "name": "value", "span": span(1, 1, 5)}}]}, "exported": false, "ir_schema_version": 1, "is_async": false, "kind": "function", "name": "identity", "params": [{"annotation": "T", "default": none, "name": "value"}], "return_type": "T", "span": span(1, 1, 30), "type_params": ["T"], "visibility": "public"}
-        let numeric_call = {"args": [{"kind": "positional", "value": {"kind": "literal", "literal_kind": "number", "span": span(1, 10, 1), "value": 1}}], "callee": {"kind": "name", "name": "identity", "span": span(1, 1, 8)}, "kind": "call", "span": span(1, 1, 11)}
-        let textual_call = {"args": [{"kind": "positional", "value": {"kind": "literal", "literal_kind": "text", "span": span(1, 10, 5), "value": "zap"}}], "callee": {"kind": "name", "name": "identity", "span": span(1, 1, 8)}, "kind": "call", "span": span(1, 1, 15)}
-        let numeric_declaration = {"annotation": "number", "exported": false, "inferred_type": "number", "ir_schema_version": 1, "kind": "declaration", "name": "numeric", "span": span(4, 1, 33), "value": numeric_call}
-        let textual_declaration = {"annotation": "text", "exported": false, "inferred_type": "text", "ir_schema_version": 1, "kind": "declaration", "name": "textual", "span": span(5, 1, 35), "value": textual_call}
-        return json({"candidate_only": true, "ir": {"nodes": [function_node, numeric_declaration, textual_declaration]}, "kind": "zap.typed_ir", "schema_version": 1, "source_name": source_name})
-    let lines = split(source, "\n")
-    if len(lines) > 1:
-        return emit_declarations(source, source_name)
-    let line = trim(lines[0])
-    let assignment = split(line, " = ")
-    let left = trim(assignment[0])
-    let annotation_parts = split(left, ":")
-    let variable = trim(substring(annotation_parts[0], 4, len(annotation_parts[0])))
-    let annotation = trim(annotation_parts[1])
-    let expression = trim(assignment[1])
-    let literal = expression_node(expression)
-    let inferred_type = inferred_type_for(expression)
-    let declaration = {"annotation": annotation, "exported": false, "inferred_type": inferred_type, "ir_schema_version": 1, "kind": "declaration", "name": variable, "span": span(1, 1, len(line)), "value": literal}
-    let ir = {"nodes": [declaration]}
-    return json({"candidate_only": true, "ir": ir, "kind": "zap.typed_ir", "schema_version": 1, "source_name": source_name})
+export fn typed_ir_direct_statement(statement):
+    let kind = statement["kind"]
+    if kind == "declaration":
+        return {"annotation": statement["annotation"], "exported": statement["exported"], "inferred_type": typed_ir_inferred_type_node(statement["value"]), "ir_schema_version": 1, "kind": kind, "name": statement["name"], "span": statement["span"], "value": statement["value"]}
+    if kind == "field":
+        return {"annotation": statement["annotation"], "inferred_type": typed_ir_inferred_type_node(statement["value"]), "ir_schema_version": 1, "kind": kind, "name": statement["name"], "span": statement["span"], "value": statement["value"], "visibility": statement["visibility"]}
+    if kind == "assignment":
+        if contains(json(statement), "\"target\""):
+            return {"kind": kind, "name": statement["name"], "span": statement["span"], "target": statement["target"], "value": statement["value"]}
+        return {"kind": kind, "name": statement["name"], "span": statement["span"], "value": statement["value"]}
+    if kind == "say" or kind == "return" or kind == "raise" or kind == "expression":
+        return {"kind": kind, "payload": statement["value"], "span": statement["span"], "value": statement["value"]}
+    if kind == "function":
+        return {"body": {"statements": typed_ir_direct_statements(statement["body"]["statements"], [])}, "exported": statement["exported"], "ir_schema_version": 1, "is_async": statement["is_async"], "kind": kind, "name": statement["name"], "params": statement["params"], "return_type": statement["return_type"], "span": statement["span"], "type_params": statement["type_params"], "visibility": statement["visibility"]}
+    if kind == "class":
+        let traits = []
+        let interfaces = []
+        let parents = []
+        let trait_selections = []
+        if contains(json(statement), "\"traits\""):
+            traits = statement["traits"]
+        if contains(json(statement), "\"interfaces\""):
+            interfaces = statement["interfaces"]
+        if contains(json(statement), "\"parents\""):
+            parents = statement["parents"]
+        if contains(json(statement), "\"trait_selections\""):
+            trait_selections = statement["trait_selections"]
+        let body = {"statements": typed_ir_direct_statements(statement["body"]["statements"], [])}
+        if len(traits) > 0 or len(interfaces) > 0 or len(parents) > 0 or len(trait_selections) > 0:
+            return {"base": statement["base"], "body": body, "interfaces": interfaces, "kind": kind, "name": statement["name"], "parents": parents, "span": statement["span"], "trait_selections": trait_selections, "traits": traits}
+        return {"base": statement["base"], "body": body, "kind": kind, "name": statement["name"], "span": statement["span"]}
+    if kind == "trait" or kind == "interface":
+        return {"body": {"statements": typed_ir_direct_statements(statement["body"]["statements"], [])}, "kind": kind, "name": statement["name"], "span": statement["span"]}
+    if kind == "if":
+        let else_branch = none
+        if statement["else_branch"] != none:
+            else_branch = {"statements": typed_ir_direct_statements(statement["else_branch"]["statements"], [])}
+        return {"condition": statement["condition"], "else_branch": else_branch, "kind": kind, "span": statement["span"], "then_branch": {"statements": typed_ir_direct_statements(statement["then_branch"]["statements"], [])}}
+    if kind == "while":
+        return {"body": {"statements": typed_ir_direct_statements(statement["body"]["statements"], [])}, "condition": statement["condition"], "kind": kind, "span": statement["span"]}
+    if kind == "for":
+        return {"body": {"statements": typed_ir_direct_statements(statement["body"]["statements"], [])}, "binding": statement["binding"], "iterable": statement["iterable"], "kind": kind, "span": statement["span"]}
+    if kind == "try_catch":
+        let catch_binding = none
+        if contains(json(statement), "\"catch_binding\""):
+            catch_binding = statement["catch_binding"]
+        return {"body": {"statements": typed_ir_direct_statements(statement["body"]["statements"], [])}, "catch_binding": catch_binding, "catch_body": {"statements": typed_ir_direct_statements(statement["catch_body"]["statements"], [])}, "kind": kind, "span": statement["span"]}
+    return statement
+
+export fn typed_ir_direct_statements(statements, result):
+    let output = result
+    for statement in statements:
+        output = append(output, typed_ir_direct_statement(statement))
+    return output
+
+export fn emit(source, source_name):
+    let parsed = from_json(parse_canonical(source, source_name))
+    if parsed["kind"] != "zap.ast":
+        return json({"candidate_only": false, "diagnostics": parsed["diagnostics"], "ir": {"nodes": []}, "kind": "zap.typed_ir", "schema_version": 2, "source_name": source_name})
+    let nodes = typed_ir_direct_statements(parsed["ast"]["statements"], [])
+    let metadata = typed_ir_trait_nodes(parsed["ast"]["statements"], [])
+    for item in metadata:
+        nodes = append(nodes, item)
+    return json({"candidate_only": false, "ir": {"nodes": nodes}, "kind": "zap.typed_ir", "schema_version": 2, "source_name": source_name, "trait_obligations": len(metadata) > 0})

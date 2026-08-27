@@ -1,0 +1,1 @@
+{"ast":{"statements":[{"alias":null,"explicit":false,"kind":"import","path":"helpers.zp","span":{"column":1,"length":16,"line":1}},{"alias":"other","explicit":false,"kind":"import","path":"other.zp","span":{"column":1,"length":23,"line":2}}]},"kind":"zap.ast","schema_version":1,"source_name":"bootstrap/fixtures/parser/generated_use.zp"}

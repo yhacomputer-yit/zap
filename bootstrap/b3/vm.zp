@@ -29,7 +29,21 @@ export fn vm_push(state, value):
 export fn vm_store(state, name, value):
     return vm_state_with(state["error"], state["halted"], state["handlers"], state["ip"], append(state["locals"], {"name": name, "value": value}), state["output"], state["stack"], state["frames"], state["functions"])
 
-export fn vm_load(state, name):
+export fn vm_module_value_key(module_path, name):
+    return "__zap_module_value::" + module_path + "::" + name
+
+export fn vm_module_import_key(module_path):
+    return "__zap_module_imports::" + module_path
+
+export fn vm_module_scope_locals(locals, index, result):
+    if index >= len(locals):
+        return result
+    let item = locals[index]
+    if starts_with(item["name"], "__zap_module_value::") or starts_with(item["name"], "__zap_module_imports::"):
+        return vm_module_scope_locals(locals, index + 1, append(result, item))
+    return vm_module_scope_locals(locals, index + 1, result)
+
+export fn vm_direct_load(state, name):
     let found = none
     for item in state["locals"]:
         if item["name"] == name:
@@ -37,6 +51,48 @@ export fn vm_load(state, name):
     if found == none:
         return {"error": "unknown_local:" + name, "value": none, "state": state}
     return {"error": none, "value": found, "state": state}
+
+export fn vm_imported_value(state, imports, name, index):
+    if index >= len(imports):
+        return {"error": "unknown_local:" + name, "value": none, "state": state}
+    let later = vm_imported_value(state, imports, name, index + 1)
+    if later["error"] == none:
+        return later
+    let imported = imports[index]
+    if vm_import_symbol_allowed(imported["symbols"], name, 0):
+        let loaded = vm_direct_load(state, vm_module_value_key(imported["path"], name))
+        if loaded["error"] == none:
+            return loaded
+    return later
+
+export fn vm_module_load(state, module_path, name):
+    let own = vm_direct_load(state, vm_module_value_key(module_path, name))
+    if own["error"] == none:
+        return own
+    let local_imports = vm_direct_load(state, vm_module_import_key(module_path))
+    if local_imports["error"] == none:
+        return vm_imported_value(state, local_imports["value"], name, 0)
+    return {"error": "unknown_local:" + name, "value": none, "state": state}
+
+export fn vm_load(state, name):
+    let direct = vm_direct_load(state, name)
+    if direct["error"] == none:
+        return direct
+    let current_module = vm_current_module_path(state)
+    if current_module != none:
+        let own = vm_direct_load(state, vm_module_value_key(current_module, name))
+        if own["error"] == none:
+            return own
+        let frame_imports = vm_current_imports(state)
+        let imported = vm_imported_value(state, frame_imports, name, 0)
+        if imported["error"] == none:
+            return imported
+    let imports = vm_direct_load(state, "__zap_imports")
+    if imports["error"] == none:
+        let imported = vm_imported_value(state, imports["value"], name, 0)
+        if imported["error"] == none:
+            return imported
+    return {"error": "unknown_local:" + name, "value": none, "state": state}
 
 export fn vm_stack_without_last(stack):
     return vm_array_without_last(stack)
@@ -92,6 +148,13 @@ export fn vm_local_load(locals, name, index, found):
         return locals[index]["value"]
     return vm_local_load(locals, name, index + 1, found)
 
+export fn vm_symbol_allowed(symbols, name, index):
+    if index >= len(symbols):
+        return false
+    if symbols[index] == name:
+        return true
+    return vm_symbol_allowed(symbols, name, index + 1)
+
 export fn vm_sync_captures(caller_locals, closure_name, captures, callee_state, index, result):
     if index >= len(captures):
         let original = vm_local_load(caller_locals, closure_name, 0, none)
@@ -133,9 +196,60 @@ export fn vm_object_set_field(object, field, value, index, result):
 export fn vm_find_function(functions, name, index):
     if index >= len(functions):
         return none
-    if functions[index]["op"] == "function_def" and functions[index]["name"] == name:
-        return functions[index]
+    let instruction = functions[index]
+    let module_function = contains(json(instruction), "\"module_path\"")
+    if instruction["op"] == "function_def" and instruction["name"] == name and not module_function:
+        return instruction
     return vm_find_function(functions, name, index + 1)
+
+export fn vm_find_function_in_module(functions, module_path, name, index):
+    if index >= len(functions):
+        return none
+    let instruction = functions[index]
+    if instruction["op"] == "function_def" and instruction["name"] == name and contains(json(instruction), "\"module_path\"") and instruction["module_path"] == module_path:
+        return instruction
+    return vm_find_function_in_module(functions, module_path, name, index + 1)
+
+export fn vm_import_symbol_allowed(symbols, name, index):
+    if index >= len(symbols):
+        return false
+    if symbols[index] == name:
+        return true
+    return vm_import_symbol_allowed(symbols, name, index + 1)
+
+export fn vm_find_imported_function(functions, imports, name, index):
+    if index >= len(imports):
+        return none
+    let later = vm_find_imported_function(functions, imports, name, index + 1)
+    if later != none:
+        return later
+    let imported = imports[index]
+    if vm_import_symbol_allowed(imported["symbols"], name, 0):
+        let definition = vm_find_function_in_module(functions, imported["path"], name, 0)
+        if definition != none:
+            return definition
+    return none
+
+export fn vm_current_frame(state):
+    if len(state["frames"]) == 0:
+        return none
+    return state["frames"][len(state["frames"]) - 1]
+
+export fn vm_current_module_path(state):
+    let frame = vm_current_frame(state)
+    if frame == none:
+        return none
+    if contains(json(frame), "\"module_path\""):
+        return frame["module_path"]
+    return none
+
+export fn vm_current_imports(state):
+    let frame = vm_current_frame(state)
+    if frame == none:
+        return []
+    if contains(json(frame), "\"imports\""):
+        return frame["imports"]
+    return []
 
 export fn vm_find_class(functions, name, index):
     if index >= len(functions):
@@ -143,6 +257,60 @@ export fn vm_find_class(functions, name, index):
     if functions[index]["op"] == "class_def" and functions[index]["name"] == name:
         return functions[index]
     return vm_find_class(functions, name, index + 1)
+
+export fn vm_class_field_values(functions, class_name, result):
+    let class = vm_find_class(functions, class_name, 0)
+    if class == none:
+        return result
+    let inherited = result
+    if class["base"] != none:
+        inherited = vm_class_field_values(functions, class["base"], inherited)
+    if contains(json(class), "\"fields\""):
+        for field in class["fields"]:
+            inherited = append(inherited, {"name": field["name"], "value": field["value"]})
+    return inherited
+
+export fn vm_run_with_state(program, state):
+    let current = state
+    while current["ip"] < len(program):
+        if current["halted"]:
+            break
+        current = vm_step(current, program[current["ip"]])
+    return current
+
+export fn vm_run_with_locals(program, functions, locals):
+    return vm_run_with_state(program, vm_state_with(none, false, [], 0, locals, [], [], [], functions))
+
+export fn vm_runtime_field_value(field, class_name, functions, locals, fields):
+    if not contains(json(field), "\"default_instructions\""):
+        return {"error": none, "value": field["value"]}
+    let receiver = {"class_name": class_name, "fields": fields, "object": true}
+    let scoped = append(locals, {"name": "self", "value": receiver})
+    let program = append(field["default_instructions"], {"op": "halt"})
+    let state = vm_run_with_locals(program, functions, scoped)
+    if state["error"] != none:
+        return {"error": state["error"], "value": none}
+    if len(state["stack"]) == 0:
+        return {"error": "field_default_no_value:" + field["name"], "value": none}
+    return {"error": none, "value": state["stack"][len(state["stack"]) - 1]}
+
+export fn vm_class_field_values_runtime(functions, class_name, locals, result):
+    let class = vm_find_class(functions, class_name, 0)
+    if class == none:
+        return {"error": "unknown_class:" + class_name, "fields": result}
+    let inherited = result
+    if class["base"] != none:
+        let parent = vm_class_field_values_runtime(functions, class["base"], locals, inherited)
+        if parent["error"] != none:
+            return parent
+        inherited = parent["fields"]
+    if contains(json(class), "\"fields\""):
+        for field in class["fields"]:
+            let evaluated = vm_runtime_field_value(field, class_name, functions, locals, inherited)
+            if evaluated["error"] != none:
+                return {"error": evaluated["error"], "fields": inherited}
+            inherited = append(inherited, {"name": field["name"], "value": evaluated["value"]})
+    return {"error": none, "fields": inherited}
 
 export fn vm_find_trait(functions, name, index):
     if index >= len(functions):
@@ -377,9 +545,121 @@ export fn vm_return_value(state, value):
         restored_locals = append(restored_locals, {"name": "self", "value": returned_value})
     return vm_state_with(none, false, frame["handlers"], frame["return_ip"], restored_locals, state["output"], append(frame["stack"], returned_value), vm_array_without_last(state["frames"]), state["functions"])
 
+export fn vm_map_has_key(target, key):
+    let key_json = json(key)
+    let serialized = json(target)
+    return contains(serialized, key_json + ":")
+
+export fn vm_field_value(target, field):
+    let serialized = json(target)
+    if starts_with(serialized, "{\"class_name\":"):
+        return vm_object_field(target, field, len(target["fields"]) - 1)
+    if not starts_with(serialized, "{"):
+        return {"error": "unknown_field:" + field, "value": none}
+    if not vm_map_has_key(target, field):
+        return {"error": "unknown_field:" + field, "value": none}
+    return {"error": none, "value": target[field]}
+
+export fn vm_list_set(values, index, value, cursor, result):
+    if cursor >= len(values):
+        return result
+    if cursor == index:
+        return vm_list_set(values, index, value, cursor + 1, append(result, value))
+    return vm_list_set(values, index, value, cursor + 1, append(result, values[cursor]))
+
+export fn vm_structural_map_set(target, key, value):
+    let serialized = json(target)
+    if not starts_with(serialized, "{"):
+        return {"error": "map_set_requires_map", "value": none}
+    if not starts_with(json(key), "\""):
+        return {"error": "map_index_requires_text", "value": none}
+    return {"error": none, "value": map_set(target, key, value)}
+
+export fn vm_index_store_value(target, key, value):
+    let serialized = json(target)
+    if starts_with(serialized, "["):
+        if starts_with(json(key), "\""):
+            return {"error": "list_index_requires_number", "value": none}
+        if key < 0 or key >= len(target):
+            return {"error": "list_index_out_of_bounds", "value": none}
+        return {"error": none, "value": vm_list_set(target, key, value, 0, [])}
+    if starts_with(serialized, "{"):
+        return vm_structural_map_set(target, key, value)
+    return {"error": "value_not_indexable", "value": none}
+
+export fn vm_iter_length(target):
+    let serialized = json(target)
+    if starts_with(serialized, "[") or starts_with(serialized, "\""):
+        return {"error": none, "value": len(target)}
+    if starts_with(serialized, "{"):
+        return {"error": none, "value": len(entries(target))}
+    return {"error": "for expects a list, map, or text", "value": none}
+
+export fn vm_iter_get(target, index):
+    let serialized = json(target)
+    if starts_with(serialized, "["):
+        return vm_index_value(target, index)
+    if starts_with(serialized, "{"):
+        let map_entries = entries(target)
+        let entry = vm_index_value(map_entries, index)
+        if entry["error"] != none:
+            return entry
+        return {"error": none, "value": entry["value"]["key"]}
+    if starts_with(serialized, "\""):
+        if index < 0 or index >= len(target):
+            return {"error": "iter_index_out_of_bounds", "value": none}
+        return {"error": none, "value": substring(target, index, index + 1)}
+    return {"error": "for expects a list, map, or text", "value": none}
+
+export fn vm_index_value(target, key):
+    let serialized = json(target)
+    if starts_with(serialized, "["):
+        if starts_with(json(key), "\""):
+            return {"error": "list_index_requires_number", "value": none}
+        if key < 0:
+            return {"error": "list_index_out_of_bounds", "value": none}
+        if key >= len(target):
+            return {"error": "list_index_out_of_bounds", "value": none}
+        return {"error": none, "value": target[key]}
+    if starts_with(serialized, "{"):
+        if not starts_with(json(key), "\""):
+            return {"error": "map_index_requires_text", "value": none}
+        if not vm_map_has_key(target, key):
+            return {"error": "map_key_not_found", "value": none}
+        return {"error": none, "value": target[key]}
+    return {"error": "value_not_indexable", "value": none}
+
 export fn vm_step(state, instruction):
     let op = instruction["op"]
     let advanced = vm_state_with(state["error"], state["halted"], state["handlers"], state["ip"] + 1, state["locals"], state["output"], state["stack"], state["frames"], state["functions"])
+    if op == "module_alias":
+        let symbols = []
+        let module_path = none
+        if contains(json(instruction), "\"symbols\""):
+            symbols = instruction["symbols"]
+        if contains(json(instruction), "\"module_path\""):
+            module_path = instruction["module_path"]
+        return vm_store(advanced, instruction["name"], {"alias": instruction["name"], "module_alias": true, "module_path": module_path, "symbols": symbols})
+    if op == "module_import_local":
+        let current = vm_direct_load(advanced, vm_module_import_key(instruction["module_path"]))
+        let imports = []
+        if current["error"] == none:
+            imports = current["value"]
+        return vm_store(advanced, vm_module_import_key(instruction["module_path"]), append(imports, {"path": instruction["imported_path"], "symbols": instruction["symbols"]}))
+    if op == "module_store":
+        let stored = vm_pop(advanced)
+        if stored["error"] != none:
+            return vm_fail(advanced, stored["error"])
+        return vm_store(stored["state"], vm_module_value_key(instruction["module_path"], instruction["name"]), stored["value"])
+    if op == "module_import":
+        let symbols = []
+        if contains(json(instruction), "\"symbols\""):
+            symbols = instruction["symbols"]
+        let current = vm_load(advanced, "__zap_imports")
+        let imports = []
+        if current["error"] == none:
+            imports = current["value"]
+        return vm_store(advanced, "__zap_imports", append(imports, {"path": instruction["module_path"], "symbols": symbols}))
     if op == "function_def":
         let registered = advanced
         if instruction["binding"] != none:
@@ -438,6 +718,11 @@ export fn vm_step(state, instruction):
         if loaded["error"] != none:
             return vm_fail(advanced, loaded["error"])
         return vm_push(loaded["state"], loaded["value"])
+    if op == "module_load":
+        let loaded = vm_module_load(advanced, instruction["module_path"], instruction["name"])
+        if loaded["error"] != none:
+            return vm_fail(advanced, loaded["error"])
+        return vm_push(loaded["state"], loaded["value"])
     if op == "store":
         let stored = vm_pop(advanced)
         if stored["error"] != none:
@@ -447,10 +732,73 @@ export fn vm_step(state, instruction):
         let receiver = vm_load(advanced, instruction["receiver"])
         if receiver["error"] != none:
             return vm_fail(advanced, receiver["error"])
-        let field = vm_object_field(receiver["value"], instruction["field"], len(receiver["value"]["fields"]) - 1)
+        let receiver_json = json(receiver["value"])
+        if contains(receiver_json, "\"module_alias\":true"):
+            if not vm_import_symbol_allowed(receiver["value"]["symbols"], instruction["field"], 0):
+                return vm_fail(advanced, "module_symbol_not_exported:" + instruction["field"])
+            let module_value = vm_direct_load(advanced, vm_module_value_key(receiver["value"]["module_path"], instruction["field"]))
+            if module_value["error"] != none:
+                return vm_fail(advanced, module_value["error"])
+            return vm_push(module_value["state"], module_value["value"])
+        let field = vm_field_value(receiver["value"], instruction["field"])
         if field["error"] != none:
             return vm_fail(advanced, field["error"])
         return vm_push(advanced, field["value"])
+    if op == "iter_length":
+        let iterable = vm_pop(advanced)
+        if iterable["error"] != none:
+            return vm_fail(advanced, iterable["error"])
+        let length = vm_iter_length(iterable["value"])
+        if length["error"] != none:
+            return vm_fail(iterable["state"], length["error"])
+        return vm_push(iterable["state"], length["value"])
+    if op == "iter_get":
+        let popped_index = vm_pop(advanced)
+        if popped_index["error"] != none:
+            return vm_fail(advanced, popped_index["error"])
+        let popped_target = vm_pop(popped_index["state"])
+        if popped_target["error"] != none:
+            return vm_fail(popped_index["state"], popped_target["error"])
+        let item = vm_iter_get(popped_target["value"], popped_index["value"])
+        if item["error"] != none:
+            return vm_fail(popped_target["state"], item["error"])
+        return vm_push(popped_target["state"], item["value"])
+    if op == "member_load":
+        let popped_key = vm_pop(advanced)
+        if popped_key["error"] != none:
+            return vm_fail(advanced, popped_key["error"])
+        let popped_target = vm_pop(popped_key["state"])
+        if popped_target["error"] != none:
+            return vm_fail(popped_key["state"], popped_target["error"])
+        let member = vm_field_value(popped_target["value"], popped_key["value"])
+        if member["error"] != none:
+            return vm_fail(popped_target["state"], member["error"])
+        return vm_push(popped_target["state"], member["value"])
+    if op == "index":
+        let popped_key = vm_pop(advanced)
+        if popped_key["error"] != none:
+            return vm_fail(advanced, popped_key["error"])
+        let popped_target = vm_pop(popped_key["state"])
+        if popped_target["error"] != none:
+            return vm_fail(advanced, popped_target["error"])
+        let indexed = vm_index_value(popped_target["value"], popped_key["value"])
+        if indexed["error"] != none:
+            return vm_fail(popped_target["state"], indexed["error"])
+        return vm_push(popped_target["state"], indexed["value"])
+    if op == "index_store":
+        let stored = vm_pop(advanced)
+        if stored["error"] != none:
+            return vm_fail(advanced, stored["error"])
+        let popped_key = vm_pop(stored["state"])
+        if popped_key["error"] != none:
+            return vm_fail(stored["state"], popped_key["error"])
+        let popped_target = vm_pop(popped_key["state"])
+        if popped_target["error"] != none:
+            return vm_fail(popped_key["state"], popped_target["error"])
+        let updated = vm_index_store_value(popped_target["value"], popped_key["value"], stored["value"])
+        if updated["error"] != none:
+            return vm_fail(popped_target["state"], updated["error"])
+        return vm_store(popped_target["state"], instruction["receiver"], updated["value"])
     if op == "field_store":
         let stored = vm_pop(advanced)
         if stored["error"] != none:
@@ -458,7 +806,14 @@ export fn vm_step(state, instruction):
         let receiver = vm_load(stored["state"], instruction["receiver"])
         if receiver["error"] != none:
             return vm_fail(stored["state"], receiver["error"])
-        let updated = {"class_name": receiver["value"]["class_name"], "fields": vm_object_set_field(receiver["value"], instruction["field"], stored["value"], 0, []), "object": true}
+        let receiver_value = receiver["value"]
+        let serialized_receiver = json(receiver_value)
+        if starts_with(serialized_receiver, "{") and not starts_with(serialized_receiver, "{\"class_name\":"):
+            let updated_map = vm_index_store_value(receiver_value, instruction["field"], stored["value"])
+            if updated_map["error"] != none:
+                return vm_fail(stored["state"], updated_map["error"])
+            return vm_store(stored["state"], instruction["receiver"], updated_map["value"])
+        let updated = {"class_name": receiver_value["class_name"], "fields": vm_object_set_field(receiver_value, instruction["field"], stored["value"], 0, []), "object": true}
         return vm_store(stored["state"], instruction["receiver"], updated)
     if op == "const":
         return vm_push(advanced, instruction["value"])
@@ -467,6 +822,23 @@ export fn vm_step(state, instruction):
         if operand["error"] != none:
             return vm_fail(advanced, operand["error"])
         return vm_push(operand["state"], not operand["value"])
+    if op == "await":
+        let awaited = vm_pop(advanced)
+        if awaited["error"] != none:
+            return vm_fail(advanced, awaited["error"])
+        return vm_push(awaited["state"], awaited["value"])
+    if op == "propagate":
+        let propagated = vm_pop(advanced)
+        if propagated["error"] != none:
+            return vm_fail(advanced, propagated["error"])
+        let value = propagated["value"]
+        let serialized = json(value)
+        if starts_with(serialized, "{") and vm_map_has_key(value, "ok"):
+            if value["ok"] == true and vm_map_has_key(value, "value"):
+                return vm_push(propagated["state"], value["value"])
+            if vm_map_has_key(value, "error") and value["error"] != none:
+                return vm_raise_value(propagated["state"], value["error"])
+        return vm_fail(propagated["state"], "propagate_requires_result_or_option")
     if op == "super_call":
         if len(state["frames"]) == 0:
             return vm_fail(advanced, "super_outside_method")
@@ -504,6 +876,13 @@ export fn vm_step(state, instruction):
         let receiver = vm_load(method_arguments["state"], instruction["receiver"])
         if receiver["error"] != none:
             return vm_fail(advanced, receiver["error"])
+        let receiver_json = json(receiver["value"])
+        if contains(receiver_json, "\"module_alias\":true"):
+            if contains(receiver_json, "\"symbols\"") and not vm_symbol_allowed(receiver["value"]["symbols"], instruction["method"], 0):
+                return vm_fail(advanced, "module_symbol_not_exported:" + instruction["method"])
+            let alias_base = vm_state_with(none, false, method_arguments["state"]["handlers"], advanced["ip"] - 1, method_arguments["state"]["locals"], method_arguments["state"]["output"], method_arguments["state"]["stack"], method_arguments["state"]["frames"], method_arguments["state"]["functions"])
+            let alias_state = vm_push_values(alias_base, method_arguments["values"], 0)
+            return vm_step(alias_state, {"argc": instruction["argc"], "module_path": receiver["value"]["module_path"], "name": instruction["method"], "op": "call"})
         let receiver_state = vm_state_with(none, false, method_arguments["state"]["handlers"], advanced["ip"] - 1, method_arguments["state"]["locals"], method_arguments["state"]["output"], method_arguments["state"]["stack"], method_arguments["state"]["frames"], method_arguments["state"]["functions"])
         let with_receiver = vm_push_values(vm_push(receiver_state, receiver["value"]), method_arguments["values"], 0)
         return vm_step(with_receiver, {"argc": instruction["argc"] + 1, "name": instruction["method"], "op": "call", "owner": receiver["value"]["class_name"]})
@@ -519,6 +898,11 @@ export fn vm_step(state, instruction):
             if value < 0:
                 value = 0 - value
             return vm_push(arguments["state"], value)
+        if name == "map_set" and instruction["argc"] == 3:
+            let updated = vm_structural_map_set(arguments["values"][0], arguments["values"][1], arguments["values"][2])
+            if updated["error"] != none:
+                return vm_fail(arguments["state"], updated["error"])
+            return vm_push(arguments["state"], updated["value"])
         let definition_name = name
         let captures = []
         let owner = none
@@ -544,13 +928,33 @@ export fn vm_step(state, instruction):
                 definition_name = loaded["value"]["function_name"]
                 captures = loaded["value"]["captures"]
         let definition = none
+        let requested_module = none
+        if contains(instruction_json, "\"module_path\""):
+            requested_module = instruction["module_path"]
         if owner != none:
             let method_resolution = vm_resolve_method(advanced["functions"], owner, definition_name)
             if method_resolution["error"] != none:
                 return vm_fail(advanced, method_resolution["error"])
             definition = method_resolution["method"]
         else:
-            definition = vm_find_function(advanced["functions"], definition_name, 0)
+            if requested_module != none:
+                definition = vm_find_function_in_module(advanced["functions"], requested_module, definition_name, 0)
+                if definition == none:
+                    return vm_fail(advanced, "module_lookup_failed:" + requested_module + ":" + definition_name)
+            else:
+                let current_module = vm_current_module_path(arguments["state"])
+                if current_module != none:
+                    definition = vm_find_function_in_module(advanced["functions"], current_module, definition_name, 0)
+                    if definition == none:
+                        definition = vm_find_imported_function(advanced["functions"], vm_current_imports(arguments["state"]), definition_name, 0)
+                else:
+                    let imported = vm_load(arguments["state"], "__zap_imports")
+                    let imported_records = []
+                    if imported["error"] == none:
+                        imported_records = imported["value"]
+                    definition = vm_find_imported_function(advanced["functions"], imported_records, definition_name, 0)
+                    if definition == none:
+                        definition = vm_find_function(advanced["functions"], definition_name, 0)
         if definition == none:
             let class = vm_find_class(advanced["functions"], definition_name, 0)
             if class != none:
@@ -562,11 +966,14 @@ export fn vm_step(state, instruction):
                 if constructor_resolution["error"] != none:
                     return vm_fail(advanced, constructor_resolution["error"])
                 let constructor_definition = constructor_resolution["method"]
+                let field_result = vm_class_field_values_runtime(advanced["functions"], definition_name, arguments["state"]["locals"], [])
+                if field_result["error"] != none:
+                    return vm_fail(advanced, field_result["error"])
                 if constructor_definition == none:
                     if instruction["argc"] == 0:
-                        return vm_push(arguments["state"], {"class_name": definition_name, "fields": [], "object": true})
+                        return vm_push(arguments["state"], {"class_name": definition_name, "fields": field_result["fields"], "object": true})
                     return vm_fail(advanced, "arity_error:" + name)
-                let instance = {"class_name": definition_name, "fields": [], "object": true}
+                let instance = {"class_name": definition_name, "fields": field_result["fields"], "object": true}
                 let constructor_state = vm_state_with(none, false, arguments["state"]["handlers"], advanced["ip"] - 1, arguments["state"]["locals"], arguments["state"]["output"], arguments["state"]["stack"], arguments["state"]["frames"], arguments["state"]["functions"])
                 let with_instance = vm_push_values(vm_push(constructor_state, instance), arguments["values"], 0)
                 return vm_step(with_instance, {"argc": instruction["argc"] + 1, "name": "__init__", "op": "call", "owner": definition_name, "constructor": true, "instance": instance})
@@ -582,8 +989,17 @@ export fn vm_step(state, instruction):
         let frame_owner = owner
         if owner != none:
             frame_owner = definition["owner"]
-        let frame = {"capture_names": capture_names, "closure_name": closure_name, "constructor_instance": constructor_instance, "function": definition_name, "handlers": arguments["state"]["handlers"], "is_constructor": constructor, "locals": arguments["state"]["locals"], "owner": frame_owner, "return_ip": arguments["state"]["ip"], "stack": arguments["state"]["stack"]}
-        let callee = vm_state_with(none, false, [], definition["entry"], [], arguments["state"]["output"], [], append(arguments["state"]["frames"], frame), arguments["state"]["functions"])
+        let frame_module = none
+        let frame_imports = []
+        if contains(json(definition), "\"module_path\""):
+            frame_module = definition["module_path"]
+        if contains(json(definition), "\"imports\""):
+            frame_imports = definition["imports"]
+        let frame = {"capture_names": capture_names, "closure_name": closure_name, "constructor_instance": constructor_instance, "function": definition_name, "handlers": arguments["state"]["handlers"], "imports": frame_imports, "is_constructor": constructor, "locals": arguments["state"]["locals"], "module_path": frame_module, "owner": frame_owner, "return_ip": arguments["state"]["ip"], "stack": arguments["state"]["stack"]}
+        let callee_locals = []
+        if frame_module != none:
+            callee_locals = vm_module_scope_locals(arguments["state"]["locals"], 0, [])
+        let callee = vm_state_with(none, false, [], definition["entry"], callee_locals, arguments["state"]["output"], [], append(arguments["state"]["frames"], frame), arguments["state"]["functions"])
         let with_captures = vm_bind_captures(callee, captures, 0)
         return vm_bind_arguments(with_captures, definition["params"], arguments["values"], 0)
     if op == "add" or op == "subtract" or op == "multiply" or op == "divide" or op == "remainder" or op == "equal" or op == "not_equal" or op == "less" or op == "less_equal" or op == "greater" or op == "greater_equal" or op == "and" or op == "or":
@@ -632,9 +1048,4 @@ export fn vm_step(state, instruction):
 
 export fn vm_run(program):
     let functions = vm_collect_functions(program, 0, [])
-    let state = vm_state_with(none, false, [], 0, [], [], [], [], functions)
-    while state["ip"] < len(program):
-        if state["halted"]:
-            break
-        state = vm_step(state, program[state["ip"]])
-    return state
+    return vm_run_with_locals(program, functions, [])

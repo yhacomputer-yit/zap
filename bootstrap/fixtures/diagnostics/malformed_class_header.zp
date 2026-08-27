@@ -1,0 +1,2 @@
+class Broken
+    public let value: number = 1

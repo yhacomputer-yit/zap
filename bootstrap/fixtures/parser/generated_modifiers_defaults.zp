@@ -1,0 +1,4 @@
+export async fn choose(value: number = 1, label: text = "ok") -> text:
+    if value > 0:
+        return label
+    return "none"

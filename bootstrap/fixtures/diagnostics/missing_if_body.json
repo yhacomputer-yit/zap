@@ -1,0 +1,1 @@
+{"diagnostics":[{"code":"ZAP-SYNTAX-001","column":null,"help":"add an indented block","line":1,"message":"block requires an indented body at line 1","severity":"error","source_name":"bootstrap/fixtures/diagnostics/missing_if_body.zp"}],"kind":"zap.diagnostics","schema_version":1,"source_name":"bootstrap/fixtures/diagnostics/missing_if_body.zp"}

@@ -1,0 +1,3 @@
+let value = factory(outer(1, 2))[0].field
+let nested = {"items": [1 + 2, inner(3)], "record": {"ok": true}}
+let chosen = if ready then nested["items"][0] else 0

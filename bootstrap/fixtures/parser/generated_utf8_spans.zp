@@ -1,0 +1,4 @@
+let label = "你好"
+let nested = {"items": [1, 2 + 3], "text": label}
+let result = nested["items"][1]
+say result

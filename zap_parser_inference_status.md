@@ -1,49 +1,41 @@
-# Zap parser, inference, and canonical-schema status
+# Zap Bootstrap Parser, Inference, and Runtime Status
 
-Repository: https://github.com/hidecard/zap
+The checked branch is `master` at reference head `5d597be` (`v2.11.17`). [PR #17](https://github.com/hidecard/zap/pull/17) is already merged. This continuation is **uncommitted** locally and no new pull request has been opened.
 
-This report describes the current local working tree. The Rust implementation remains the differential reference. No commit or GitHub push has been made because complete B2/B3 ownership and full arbitrary-language parity are still unfinished.
+## Verified implementation
 
-## B1 parser differential status
+**B1 parser.** `parse_canonical(source, source_name)` is the rich canonical AST route for runtime and type-check consumers. `parse_general` and `parse_or_diagnostics` expose a deterministic compatibility view over the canonical result. The production parser handles sibling and nested functions/classes/traits/interfaces, mixed blocks, loops, try/catch, imports, quoted module `use`, member/index/call chains, maps, named arguments, conditional expressions, await, postfix propagation, structured assignment targets, function modifiers/default parameters, and visibility-qualified class fields. Import aliases and optional class metadata now survive span rebasing in native-compatible form. The current exact valid differential corpus is 38 cases; the diagnostic corpus is 14 cases.
 
-The production `parse(source, source_name)` entry now delegates directly to `parse_general(source, source_name)`. The body of `parse()` contains no fixture/source-shape `len(lines)` or `contains(source, ...)` routing. The general route uses recursive indentation-aware top-level sequence dispatch for declarations, functions, classes, control-flow blocks, and mixed siblings. It also includes safe source-layout rebasing for nested statements and recursive class-body extraction.
+**B2 type ownership.** The integrated checker consumes the canonical AST and performs recursive expression inference for nested collections and wrappers. It validates generic substitution, explicit multi-parameter calls, bounds, aliases and alias-of-alias expansion, recursive-alias diagnostics, imported generic cases covered by the matrix, branch/loop/short-circuit flow, reassignment invalidation, member calls, concrete map-member value types, structured mutation targets, class-field defaults, and trait obligations. Class methods retain owner metadata, inherited methods are materialized through base chains, child overrides win, and object receivers do not fall back to unrelated global method names. The standalone engine mirrors the owner-aware method behavior and the focused structured inference cases.
 
-The valid Rust-reference differential corpus currently passes **29/29 exact JSON AST comparisons** using `scripts/bootstrap/verify_b1_general_parser_batch.py`. This includes arithmetic, declarations, assignments, nested expressions, functions, classes, loops, nested blocks, mixed top-level sequences, nested functions, nested class methods, and source-span-sensitive fixtures. The runner starts one native process per fixture to avoid the repository's separate single-process multi-output framing/state limitation.
+**Typed-IR ownership.** `bootstrap/b2/typed_ir.zp` implements `emit()` as a recursive direct canonical-AST adapter. It preserves canonical spans, nested bodies, fields, dynamic `for` nodes, generic call metadata, trait metadata, and structured mutation targets. Class serialization is optional-safe for native-compatible base-only nodes. Owned output uses `candidate_only: false` and schema version `2`; legacy schema-v1 artifacts remain supported through compatibility paths.
 
-The invalid diagnostic corpus currently passes **10/10 exact JSON comparisons** using `scripts/bootstrap/verify_b1_diagnostics_batch.py`:
+**B3/B4 runtime.** The canonical AST-to-VM route covers conditional/await/propagate expressions, collections, list/map index and member access, object fields, arbitrary call arity, closures, classes, constructors, inheritance, `super`, traits, C3 MRO, loops, try/catch, raise/return, and break/continue. Dynamic list/map/text iteration uses VM `iter_length`/`iter_get`. Map index/member stores now call the structural native `map_set` builtin rather than reconstructing JSON strings. Non-foldable class field defaults are lowered to runtime instructions and evaluated at construction with caller locals and `self`, inherited fields first.
 
-| Category | Fixtures | Result |
-|---|---:|---:|
-| Lexer diagnostics | integer overflow, invalid character, unterminated string | 3/3 |
-| Delimiter/header diagnostics | missing closing bracket, unexpected closing bracket, missing function parenthesis | 3/3 |
-| Syntax/indentation diagnostics | missing assignment, invalid indentation, unexpected indentation | 3/3 |
-| Numeric-literal syntax diagnostic | decimal literal fixture | 1/1 |
-| **Total** | **10** | **10/10** |
+**Modules.** Relative imports resolve recursively with prefix-safe offsets and cycle/path diagnostics. Imported artifacts retain module-qualified function definitions, module-qualified top-level value stores, and module-local import records; module function frames receive the namespaced state, preventing plain-name leakage into importer locals. Explicit imports expose exported top-level functions/declarations/values, while quoted module `use` exposes non-exported regular symbols. Aliases use the same allowlist, duplicate imports preserve the composed prefix, and later unaliased imports win same-name collisions. An opt-in compiler-session API reuses completed module artifacts across calls, and the VM rejects disallowed alias members with `module_symbol_not_exported:<name>`.
 
-The B1 acceptance gates for the general parser, multiple class methods, unified `elif`/`try-catch`, token expressions, and the parser candidate all pass. Token expression support covers precedence, unary operators, grouping, list/map literals, nested calls, index suffixes, member suffixes, and named arguments. Top-level continuation headers such as `else`, `elif`, and `catch` are preserved within the owning block chunk instead of being misclassified as sibling statements.
+## Final verification results
 
-The remaining B1 limitation is breadth rather than the verified corpus: a larger arbitrary valid/invalid corpus is still required to establish complete parity for every Rust AST expression, statement, span, recovery, and multi-diagnostic ordering case.
+| Verification | Result |
+|---|---:|
+| Current Rust-reference B1 valid differential batch | **38/38** |
+| B1 diagnostics batch | **14/14** |
+| Bootstrap shell verifier scripts | **112/112 pass** |
+| Native Rust test targets | **275 passed** and **259 passed**, 0 failures |
+| B2 inherited/override/missing-method gate | pass |
+| B4 runtime-dependent field-default gate | pass |
+| B4 module export/alias/use gate | pass |
+| B4 structural map mutation gate | pass |
+| `git diff --check` | pass |
+| Clean-clone reproduction | **112/112 verifiers, 38/38 valid, 14/14 diagnostics; native targets 275 and 259 passed** |
 
-## B2 generic constraints and alias checking
+## Boundary statement
 
-B2 generic call inference now validates both the constraint declaration and the concrete arguments. A constraint must reference a declared type parameter, and its bound must be a valid base or nested container type. Generic instantiation rejects malformed constraints before substitution and continues to enforce arity and bound compatibility.
+These results establish a verified implementation over the current corpus and repository acceptance matrix. They do not claim exhaustive coverage of every possible Zap grammar construct. The bootstrap source-to-VM iteration extension intentionally defines non-list behavior broader than the current native evaluator's list-only `for` behavior. Top-level `break`/`continue` remain compile errors while loop-nested forms are supported.
 
-Generic alias metadata now validates the alias body recursively. Base types, declared parameters, `list`, `option`, `result`, and nested `map` forms are accepted; malformed wrappers and undeclared type symbols are rejected. The metadata exposes `body_valid`, and alias instantiation refuses invalid bodies or incorrect arity.
+Module parity remains incremental. The composed bytecode stream is retained for the current bootstrap architecture, but imported module declarations/stores are no longer plain root bindings: top-level values use canonical module-qualified keys, module imports use module-local records, and module function frames receive the namespaced state. Explicit imports expose exports only; quoted paths select non-exported regular symbols for module `use`; duplicate imports preserve earlier artifacts and later imports win collisions. The default compiler entry point uses a per-compilation `seen` set; callers can explicitly thread the opt-in artifact-cache API across compiler-session calls. Alias allowlists protect qualified calls and value access, while unqualified syntax remains governed by the import records. Unquoted dotted `use Trait.method as local` remains trait-use syntax.
 
-Existing generic bounds, generic end-to-end, generic type-declaration, type/generic, and all **33 B2 verifier scripts** pass after these changes. This is an extended foundation, not yet full reference type-checker parity. Still outstanding are multiple-parameter constraint inference in all call forms, explicit generic-call syntax, generic classes and aliases across imports, type-alias environments during AST inference, aliasing/mutation invalidation, short-circuit path sensitivity, and complete loop fixpoint/break/continue dataflow.
+Runtime field defaults and inherited method inference now pass focused behavior gates, but broader constructor argument/capture/error matrices and complete native differential coverage remain future work. Structural map mutation avoids JSON text replacement through a native host-builtin boundary; portability and exhaustive map-key/value corpus coverage remain to be expanded. The generated parser corpus is stronger at 38 valid and 14 diagnostic cases but is finite, so absolute arbitrary-source span and multi-diagnostic ordering parity is not claimed.
 
-## B3 canonical AST schema alignment
-
-The canonical Rust AST serializer defines member expressions as `{kind: "member", member, target}`, index expressions as `{kind: "index", index, target}`, maps as `{kind: "map", entries: [{key, value}]}`, and calls as `{kind: "call", callee, args}`. The B3 typed-IR expression producer now emits canonical `target/member` member fields and structured canonical `elements`/`entries` list/map nodes instead of the previous `object/property` and literal-payload forms.
-
-B3 lowering now consumes canonical member fields. A new `lower_ast_program` bridge accepts canonical parser AST blocks for declarations, literal payload statements, `if`, and `while`, and uses the same jump relocation/patching machinery as typed-IR lowering. The dedicated `verify_b3_canonical_ast_schema.sh` gate passes for member, map, and lowering field alignment. The existing typed-IR expression and bytecode-lowering gates also pass.
-
-B3 is not complete. Canonical AST names and general variable storage are not yet fully represented by the current VM instruction/state model; `for`, `try-catch`, class/function emission, full map/index runtime semantics, and complete statement/opcode coverage still require implementation. The typed-IR producer also retains some source-string parsing paths and therefore is not yet a complete AST-owned emitter.
-
-## Regression evidence
-
-The latest regression run passed the 29-fixture B1 valid batch, 10-fixture diagnostic batch, B1 parser candidate gate, all 33 B2 verifier scripts, the new B3 canonical schema gate, the existing B3 typed-IR/bytecode lowering gate, native unit/all-target tests (**272 passed**), native integration tests (**259 passed**), and `git diff --check`.
-
-## Git status and push decision
-
-Origin was fetched and local `master` was rebased onto the latest remote `origin/master` at commit `2de01a5`, including the remote mutable-loop and short-circuit loop-control work. The working tree remains intentionally uncommitted. Because the complete B2 dataflow/type semantics, complete B3 runtime/schema ownership, and broad Rust-reference differential corpus are not finished, the changes are **not yet ready for the requested final commit and GitHub push**.
+The latest working-tree and clean-clone validations passed 112/112 shell verifiers, the B1 batches passed 38/38 valid and 14/14 diagnostics, native test targets passed 275 and 259, and `git diff --check` passed in both trees.
+Temporary probes were removed. Commit, push, and a new pull request remain intentionally deferred until the user explicitly requests them.

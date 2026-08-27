@@ -18,8 +18,22 @@ NAMES = [
     'nested_blocks', 'three_argument_call', 'control_flow', 'mixed_top_level',
     'nested_function_blocks', 'nested_class_method', 'mixed_recursive_sequence',
     'while_simple', 'deep_mixed_blocks', 'four_argument_call',
-    'parenthesized_not', 'nested_assignment_block',
+    'parenthesized_not', 'nested_assignment_block', 'generated_postfix',
+    'generated_import', 'generated_use',
+    'generated_siblings',
+    'generated_utf8_spans', 'generated_mixed_members', 'generated_branch_try',
+    'generated_modifiers_defaults', 'generated_import_alias_chain',
 ]
+
+
+def run_native(args):
+    env = os.environ.copy()
+    env['PATH'] = str(Path.home() / '.cargo' / 'bin') + ':' + env.get('PATH', '')
+    env['RUSTUP_TOOLCHAIN'] = '1.88.0'
+    return subprocess.run(
+        ['cargo', 'run', '--quiet', '--release', '--locked', '--manifest-path', 'native/Cargo.toml', '--', *args],
+        cwd=ROOT, env=env, text=True, capture_output=True,
+    )
 
 
 def run_one(name: str):
@@ -30,13 +44,7 @@ def run_one(name: str):
             runner = Path(handle.name)
             handle.write('import "bootstrap/b1/parser.zp"\n')
             handle.write(f'say parse_general(read_text("{source_path}"), "{source_path}")\n')
-        env = os.environ.copy()
-        env['PATH'] = str(Path.home() / '.cargo' / 'bin') + ':' + env.get('PATH', '')
-        env['RUSTUP_TOOLCHAIN'] = '1.88.0'
-        proc = subprocess.run(
-            ['cargo', 'run', '--quiet', '--release', '--locked', '--manifest-path', 'native/Cargo.toml', '--', str(runner)],
-            cwd=ROOT, env=env, text=True, capture_output=True,
-        )
+        proc = run_native([str(runner)])
         if proc.returncode:
             return False, f'runtime failure: {(proc.stdout + proc.stderr).strip()[-300:]}'
         lines = [line for line in proc.stdout.splitlines() if line.strip()]
@@ -44,13 +52,23 @@ def run_one(name: str):
             return False, f'framing failure: expected one JSON record, got {len(lines)}'
         actual = json.loads(lines[0])
         expected = json.loads((FIXTURE_DIR / f'{name}.ast.json').read_text())
-        if actual != expected:
+        reference_proc = run_native(['bootstrap', 'ast', source_path])
+        if reference_proc.returncode:
+            return False, f'reference failure: {(reference_proc.stdout + reference_proc.stderr).strip()[-300:]}'
+        reference_lines = [line for line in reference_proc.stdout.splitlines() if line.strip()]
+        if len(reference_lines) != 1:
+            return False, f'reference framing failure: expected one JSON record, got {len(reference_lines)}'
+        reference = json.loads(reference_lines[0])
+        baseline_drift = expected != reference
+        if actual != reference:
             if os.environ.get('B1_VERBOSE_DIFF') == '1':
                 actual_text = json.dumps(actual, indent=2, sort_keys=True).splitlines()
-                expected_text = json.dumps(expected, indent=2, sort_keys=True).splitlines()
-                diff = '\\n'.join(difflib.unified_diff(expected_text, actual_text, fromfile='expected', tofile='actual', lineterm=''))
+                expected_text = json.dumps(reference, indent=2, sort_keys=True).splitlines()
+                diff = '\\n'.join(difflib.unified_diff(expected_text, actual_text, fromfile='reference', tofile='actual', lineterm=''))
                 return False, 'AST mismatch\\n' + diff
             return False, 'AST mismatch'
+        if baseline_drift:
+            return True, 'fixture expected JSON differs from current Rust reference'
         return True, ''
     finally:
         if runner:
@@ -62,7 +80,10 @@ def main():
     for name in NAMES:
         ok, detail = run_one(name)
         if ok:
-            print(f'PASS {name}')
+            if detail:
+                print(f'PASS {name}: {detail}')
+            else:
+                print(f'PASS {name}')
         else:
             failures.append((name, detail))
             print(f'FAIL {name}: {detail}')

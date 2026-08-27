@@ -8,7 +8,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 LEX_FIXTURES = ['integer_overflow', 'invalid_character', 'unterminated_string']
-PARSE_FIXTURES = ['missing_closing_bracket', 'unexpected_closing_bracket', 'missing_assignment', 'missing_function_paren']
+PARSE_FIXTURES = ['missing_closing_bracket', 'unexpected_closing_bracket', 'missing_assignment', 'missing_assignment_late', 'missing_closing_paren', 'missing_function_paren', 'malformed_class_header', 'missing_if_body']
 PARSER_DIR_FIXTURES = [
     ('invalid_indentation', 'invalid_indentation.json'),
     ('unexpected_indentation', 'unexpected_indentation.json'),

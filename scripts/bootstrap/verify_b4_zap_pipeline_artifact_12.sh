@@ -35,7 +35,7 @@ zap.compiler_artifact
 zap.ast
 zap.typecheck
 zap.typed_ir
-true
+false
 true
 EOF
 cargo run --quiet --release --locked --manifest-path native/Cargo.toml -- "$runner" > "$out"

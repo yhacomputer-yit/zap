@@ -3,10 +3,79 @@ export fn lower_literal(node):
     let instructions = []
     return append(instructions, {"op": "const", "value": node["value"]})
 
+export fn lower_constant_json_list(elements, index, result):
+    if index >= len(elements):
+        return result
+    let item = lower_constant_json(elements[index])
+    if result == "":
+        return lower_constant_json_list(elements, index + 1, item)
+    return lower_constant_json_list(elements, index + 1, result + "," + item)
+
+export fn lower_constant_json_map(entries, index, result):
+    if index >= len(entries):
+        return result
+    let entry = entries[index]
+    let key = lower_constant_json(entry["key"])
+    let value = lower_constant_json(entry["value"])
+    let item = key + ":" + value
+    if result == "":
+        return lower_constant_json_map(entries, index + 1, item)
+    return lower_constant_json_map(entries, index + 1, result + "," + item)
+
+export fn lower_constant_json(node):
+    let kind = node["kind"]
+    if kind == "literal":
+        return json(node["value"])
+    if kind == "list":
+        return "[" + lower_constant_json_list(node["elements"], 0, "") + "]"
+    if kind == "map":
+        return "{" + lower_constant_json_map(node["entries"], 0, "") + "}"
+    return ""
+
+export fn lower_constant_value(node):
+    let encoded = lower_constant_json(node)
+    if encoded == "":
+        return {"error": "non_constant_expression", "value": none}
+    return {"error": none, "value": from_json(encoded)}
+
 export fn lower_expression(node):
     let kind = node["kind"]
     if kind == "literal":
         return {"error": none, "instructions": lower_literal(node)}
+    if kind == "await" or kind == "propagate":
+        let operand = lower_expression(node["value"])
+        if operand["error"] != none:
+            return operand
+        return {"error": none, "instructions": append(operand["instructions"], {"op": kind})}
+    if kind == "conditional":
+        let condition = lower_expression(node["condition"])
+        if condition["error"] != none:
+            return condition
+        let then_value = lower_expression(node["then_branch"])
+        if then_value["error"] != none:
+            return then_value
+        let else_value = lower_expression(node["else_branch"])
+        if else_value["error"] != none:
+            return else_value
+        let instructions = condition["instructions"]
+        let false_jump = len(instructions)
+        instructions = append(instructions, {"op": "jump_if_false", "target": 0})
+        for instruction in then_value["instructions"]:
+            instructions = append(instructions, instruction)
+        let end_jump = len(instructions)
+        instructions = append(instructions, {"op": "jump", "target": 0})
+        let else_target = len(instructions)
+        for instruction in else_value["instructions"]:
+            instructions = append(instructions, instruction)
+        let end_target = len(instructions)
+        instructions = patch_jump(instructions, false_jump, else_target)
+        instructions = patch_jump(instructions, end_jump, end_target)
+        return {"error": none, "instructions": instructions}
+    if kind == "list" or kind == "map":
+        let constant = lower_constant_value(node)
+        if constant["error"] != none:
+            return {"error": "unsupported_collection_expression", "instructions": []}
+        return {"error": none, "instructions": [{"op": "const", "value": constant["value"]}]}
     if kind == "name":
         if contains(node["name"], "."):
             let pieces = split(node["name"], ".")
@@ -33,12 +102,14 @@ export fn lower_expression(node):
             instructions = append(instructions, instruction)
         return {"error": none, "instructions": append(instructions, {"op": "index"})}
     if kind == "member":
+        if node["target"]["kind"] == "name":
+            return {"error": none, "instructions": [{"field": node["member"], "op": "field_load", "receiver": node["target"]["name"]}]}
         let target = lower_expression(node["target"])
         if target["error"] != none:
             return target
         let instructions = target["instructions"]
         instructions = append(instructions, {"op": "const", "value": node["member"]})
-        return {"error": none, "instructions": append(instructions, {"op": "index"})}
+        return {"error": none, "instructions": append(instructions, {"op": "member_load"})}
     if kind == "call":
         let instructions = []
         for argument in node["args"]:
@@ -95,6 +166,43 @@ export fn lower_expression(node):
         return {"error": "unsupported_binary_operator:" + op, "instructions": []}
     return {"error": "unsupported_expression:" + kind, "instructions": []}
 
+export fn lower_for_node_b3(node, loop_start):
+    let iterable = lower_expression(node["iterable"])
+    if iterable["error"] != none:
+        return iterable
+    let marker = "__zap_b3_for_" + str(node["span"]["line"]) + "_" + str(node["span"]["column"])
+    let iterator_name = marker + "_iter"
+    let index_name = marker + "_index"
+    let instructions = iterable["instructions"]
+    instructions = append(instructions, {"name": iterator_name, "op": "store"})
+    instructions = append(instructions, {"op": "const", "value": 0})
+    instructions = append(instructions, {"name": index_name, "op": "store"})
+    let actual_loop_start = len(instructions)
+    instructions = append(instructions, {"name": index_name, "op": "load"})
+    instructions = append(instructions, {"name": iterator_name, "op": "load"})
+    instructions = append(instructions, {"op": "iter_length"})
+    instructions = append(instructions, {"op": "less"})
+    let false_jump = len(instructions)
+    instructions = append(instructions, {"op": "jump_if_false", "target": 0})
+    instructions = append(instructions, {"name": iterator_name, "op": "load"})
+    instructions = append(instructions, {"name": index_name, "op": "load"})
+    instructions = append(instructions, {"op": "iter_get"})
+    instructions = append(instructions, {"name": node["binding"], "op": "store"})
+    let body = lower_loop_body(node["body"], actual_loop_start)
+    if body["error"] != none:
+        return body
+    for instruction in body["instructions"]:
+        instructions = append(instructions, instruction)
+    instructions = append(instructions, {"name": index_name, "op": "load"})
+    instructions = append(instructions, {"op": "const", "value": 1})
+    instructions = append(instructions, {"op": "add"})
+    instructions = append(instructions, {"name": index_name, "op": "store"})
+    instructions = append(instructions, {"op": "jump", "target": actual_loop_start})
+    let end_target = len(instructions)
+    instructions = patch_jump(instructions, false_jump, end_target)
+    instructions = patch_breaks(instructions, end_target)
+    return {"error": none, "instructions": instructions}
+
 export fn lower_loop_body(body, loop_start):
     let instructions = []
     for node in body["statements"]:
@@ -123,6 +231,8 @@ export fn lower_block(body):
         let lowering_node = node
         if node["kind"] == "while":
             lowering_node = {"body": node["body"], "condition": node["condition"], "kind": "while", "loop_start": len(instructions)}
+        if node["kind"] == "for":
+            lowering_node = {"binding": node["binding"], "body": node["body"], "iterable": node["iterable"], "kind": "for", "loop_start": len(instructions), "span": node["span"]}
         let lowered = lower_node(lowering_node)
         if lowered["error"] != none:
             return lowered
@@ -177,6 +287,114 @@ export fn lower_class_trait_selections(node):
         return node["trait_selections"]
     return []
 
+export fn lower_field_list(elements, index, result):
+    if index >= len(elements):
+        return {"error": none, "value": result}
+    let item = lower_field_constant(elements[index])
+    if item["error"] != none:
+        return item
+    return lower_field_list(elements, index + 1, append(result, item["value"]))
+
+export fn lower_field_map(entries, index, serialized):
+    if index >= len(entries):
+        return {"error": none, "value": from_json(serialized + "}")}
+    let key = lower_field_constant(entries[index]["key"])
+    if key["error"] != none:
+        return key
+    let value = lower_field_constant(entries[index]["value"])
+    if value["error"] != none:
+        return value
+    let next = serialized
+    if index > 0:
+        next = next + ","
+    next = next + json(key["value"]) + ":" + json(value["value"])
+    return lower_field_map(entries, index + 1, next)
+
+export fn lower_field_binary(op, left, right):
+    if op == "add":
+        return left + right
+    if op == "subtract":
+        return left - right
+    if op == "multiply":
+        return left * right
+    if op == "divide":
+        return left / right
+    if op == "remainder":
+        return left % right
+    if op == "equal":
+        return left == right
+    if op == "not_equal":
+        return left != right
+    if op == "less":
+        return left < right
+    if op == "less_equal":
+        return left <= right
+    if op == "greater":
+        return left > right
+    if op == "greater_equal":
+        return left >= right
+    if op == "and":
+        return left and right
+    if op == "or":
+        return left or right
+    return none
+
+export fn lower_field_constant(node):
+    if node["kind"] == "literal":
+        return {"error": none, "value": node["value"]}
+    if node["kind"] == "list":
+        return lower_field_list(node["elements"], 0, [])
+    if node["kind"] == "map":
+        return lower_field_map(node["entries"], 0, "{")
+    if node["kind"] == "unary" and node["op"] == "not":
+        let operand = lower_field_constant(node["value"])
+        if operand["error"] != none:
+            return operand
+        return {"error": none, "value": not operand["value"]}
+    if node["kind"] == "binary":
+        let left = lower_field_constant(node["left"])
+        if left["error"] != none:
+            return left
+        let right = lower_field_constant(node["right"])
+        if right["error"] != none:
+            return right
+        let value = lower_field_binary(node["op"], left["value"], right["value"])
+        if value == none and node["op"] != "equal" and node["op"] != "not_equal":
+            return {"error": "unsupported_field_operator:" + node["op"], "value": none}
+        return {"error": none, "value": value}
+    if node["kind"] == "conditional":
+        let condition = lower_field_constant(node["condition"])
+        if condition["error"] != none:
+            return condition
+        if condition["value"]:
+            return lower_field_constant(node["then_branch"])
+        return lower_field_constant(node["else_branch"])
+    return {"error": "unsupported_field_default:" + node["kind"], "value": none}
+
+export fn lower_field_default(node):
+    return lower_field_constant(node)
+
+export fn lower_class_fields(statements, index, result):
+    if index >= len(statements):
+        return {"error": none, "fields": result}
+    let node = statements[index]
+    if node["kind"] != "field":
+        return lower_class_fields(statements, index + 1, result)
+    let default_value = lower_field_default(node["value"])
+    if default_value["error"] == none:
+        let field = {"name": node["name"], "value": default_value["value"], "visibility": node["visibility"]}
+        return lower_class_fields(statements, index + 1, append(result, field))
+    let dynamic = lower_expression(node["value"])
+    if dynamic["error"] != none:
+        return {"error": "unsupported_field_default:" + node["name"] + ":" + default_value["error"], "value": none}
+    let runtime_field = {"default_instructions": dynamic["instructions"], "name": node["name"], "value": none, "visibility": node["visibility"]}
+    return lower_class_fields(statements, index + 1, append(result, runtime_field))
+
+export fn lower_class_fields_from_instruction(instruction):
+    if contains(json(instruction), "\"fields\""):
+        return instruction["fields"]
+    return []
+
 export fn patch_class(instructions, index, end):
     let patched = []
     let cursor = 0
@@ -186,7 +404,7 @@ export fn patch_class(instructions, index, end):
             let traits = lower_class_traits(instruction)
             let interfaces = lower_class_interfaces(instruction)
             let trait_selections = lower_class_trait_selections(instruction)
-            patched = append(patched, {"base": instruction["base"], "end": end, "interfaces": interfaces, "name": instruction["name"], "op": "class_def", "parents": parents, "trait_selections": trait_selections, "traits": traits})
+            patched = append(patched, {"base": instruction["base"], "end": end, "fields": lower_class_fields_from_instruction(instruction), "interfaces": interfaces, "name": instruction["name"], "op": "class_def", "parents": parents, "trait_selections": trait_selections, "traits": traits})
         else:
             patched = append(patched, instruction)
         cursor = cursor + 1
@@ -224,7 +442,7 @@ export fn lower_class_body(body, prefix, owner):
         if node["kind"] == "function":
             lowered = lower_function_node_owned(node, instructions, owner)
         else:
-            if node["kind"] == "trait_use":
+            if node["kind"] == "trait_use" or node["kind"] == "field":
                 lowered = {"error": none, "instructions": instructions}
             else:
                 lowered = lower_ast_node_with_prefix(node, instructions)
@@ -259,7 +477,10 @@ export fn lower_class_node(node, prefix):
     let traits = lower_class_traits(node)
     let interfaces = lower_class_interfaces(node)
     let trait_selections = lower_class_trait_selections(node)
-    let with_class = append(prefix, {"base": node["base"], "end": 0, "interfaces": interfaces, "name": node["name"], "op": "class_def", "parents": parents, "trait_selections": trait_selections, "traits": traits})
+    let fields = lower_class_fields(node["body"]["statements"], 0, [])
+    if fields["error"] != none:
+        return fields
+    let with_class = append(prefix, {"base": node["base"], "end": 0, "fields": fields["fields"], "interfaces": interfaces, "name": node["name"], "op": "class_def", "parents": parents, "trait_selections": trait_selections, "traits": traits})
     let body = lower_class_body(node["body"], with_class, node["name"])
     if body["error"] != none:
         return body
@@ -268,6 +489,8 @@ export fn lower_class_node(node, prefix):
 
 export fn lower_node(node):
     let kind = node["kind"]
+    if kind == "for":
+        return lower_for_node_b3(node, node["loop_start"])
     if kind == "if":
         let condition = lower_expression(node["condition"])
         if condition["error"] != none:
@@ -341,6 +564,49 @@ export fn lower_node(node):
         return lowered
     return {"error": "unsupported_statement:" + kind, "instructions": []}
 
+export fn b3_rebase_function(instruction, offset):
+    let required = false
+    if contains(json(instruction), "\"required\":true"):
+        required = true
+    if contains(json(instruction), "\"module_path\""):
+        if contains(json(instruction), "\"imports\""):
+            return {"binding": instruction["binding"], "captures": instruction["captures"], "end": instruction["end"] + offset, "entry": instruction["entry"] + offset, "imports": instruction["imports"], "module_path": instruction["module_path"], "name": instruction["name"], "op": "function_def", "owner": instruction["owner"], "params": instruction["params"], "required": required}
+        return {"binding": instruction["binding"], "captures": instruction["captures"], "end": instruction["end"] + offset, "entry": instruction["entry"] + offset, "module_path": instruction["module_path"], "name": instruction["name"], "op": "function_def", "owner": instruction["owner"], "params": instruction["params"], "required": required}
+    return {"binding": instruction["binding"], "captures": instruction["captures"], "end": instruction["end"] + offset, "entry": instruction["entry"] + offset, "name": instruction["name"], "op": "function_def", "owner": instruction["owner"], "params": instruction["params"], "required": required}
+
+export fn b3_rebase_targets(instructions, offset):
+    let result = []
+    for instruction in instructions:
+        if instruction["op"] == "jump" or instruction["op"] == "jump_if_false" or instruction["op"] == "jump_if_true":
+            result = append(result, {"op": instruction["op"], "target": instruction["target"] + offset})
+        else:
+            if instruction["op"] == "try_begin":
+                result = append(result, {"binding": instruction["binding"], "op": "try_begin", "target": instruction["target"] + offset})
+            else:
+                if instruction["op"] == "function_def":
+                    result = append(result, b3_rebase_function(instruction, offset))
+                else:
+                    if instruction["op"] == "class_def":
+                        let fields = []
+                        let interfaces = []
+                        let trait_selections = []
+                        let traits = []
+                        if contains(json(instruction), "\"fields\""):
+                            fields = instruction["fields"]
+                        if contains(json(instruction), "\"interfaces\""):
+                            interfaces = instruction["interfaces"]
+                        if contains(json(instruction), "\"trait_selections\""):
+                            trait_selections = instruction["trait_selections"]
+                        if contains(json(instruction), "\"traits\""):
+                            traits = instruction["traits"]
+                        result = append(result, {"base": instruction["base"], "end": instruction["end"] + offset, "fields": fields, "interfaces": interfaces, "name": instruction["name"], "op": "class_def", "parents": instruction["parents"], "trait_selections": trait_selections, "traits": traits})
+                    else:
+                        if instruction["op"] == "trait_def":
+                            result = append(result, {"end": instruction["end"] + offset, "kind": instruction["kind"], "name": instruction["name"], "op": "trait_def"})
+                        else:
+                            result = append(result, instruction)
+    return result
+
 export fn lower_ast_block_with_prefix(body, prefix):
     let instructions = prefix
     for node in body["statements"]:
@@ -365,12 +631,31 @@ export fn lower_ast_node_with_prefix(node, prefix):
     if lowered["error"] != none:
         return lowered
     let combined = prefix
-    for instruction in lowered["instructions"]:
+    let rebased = b3_rebase_targets(lowered["instructions"], len(prefix))
+    for instruction in rebased:
         combined = append(combined, instruction)
     return {"error": none, "instructions": combined}
 
+export fn lower_import_node(node):
+    let symbols = []
+    if contains(json(node), "\"symbols\""):
+        symbols = node["symbols"]
+    if contains(json(node), "\"alias\"") and node["alias"] != none:
+        if contains(json(node), "\"module_path\""):
+            return {"error": none, "instructions": [{"module_path": node["module_path"], "name": node["alias"], "op": "module_alias", "symbols": symbols}]}
+        return {"error": none, "instructions": [{"name": node["alias"], "op": "module_alias", "symbols": symbols}]}
+    if contains(json(node), "\"module_path\""):
+        return {"error": none, "instructions": [{"module_path": node["module_path"], "op": "module_import", "symbols": symbols}]}
+    return {"error": none, "instructions": []}
+
 export fn lower_ast_node(node):
     let kind = node["kind"]
+    if kind == "for":
+        return lower_for_node_b3(node, 0)
+    if kind == "import":
+        return lower_import_node(node)
+    if kind == "module" or kind == "type_alias" or kind == "trait_use":
+        return {"error": none, "instructions": []}
     if kind == "function":
         return lower_function_node(node, [])
     if kind == "class":
@@ -420,11 +705,35 @@ export fn lower_ast_node(node):
         instructions = patch_jump(instructions, false_jump_index, end_target)
         instructions = patch_jump(instructions, end_target - 1, 0)
         return {"error": none, "instructions": instructions}
-    if kind == "declaration" or kind == "assignment":
+    if kind == "declaration":
         let lowered_value = lower_expression(node["value"])
         if lowered_value["error"] != none:
             return lowered_value
-        if kind == "assignment" and contains(node["name"], "."):
+        return {"error": none, "instructions": append(lowered_value["instructions"], {"op": "store", "name": node["name"]})}
+    if kind == "assignment":
+        let lowered_value = lower_expression(node["value"])
+        if lowered_value["error"] != none:
+            return lowered_value
+        if contains(json(node), "\"target\"") and node["target"] != none:
+            let target = node["target"]
+            if target["kind"] == "index":
+                let lowered_target = lower_expression(target["target"])
+                if lowered_target["error"] != none:
+                    return lowered_target
+                let lowered_index = lower_expression(target["index"])
+                if lowered_index["error"] != none:
+                    return lowered_index
+                let instructions = lowered_target["instructions"]
+                for item in lowered_index["instructions"]:
+                    instructions = append(instructions, item)
+                for item in lowered_value["instructions"]:
+                    instructions = append(instructions, item)
+                return {"error": none, "instructions": append(instructions, {"op": "index_store", "receiver": target["target"]["name"]})}
+            if target["kind"] == "member":
+                let member_target = target["target"]
+                if member_target["kind"] == "name":
+                    return {"error": none, "instructions": append(lowered_value["instructions"], {"field": target["member"], "op": "field_store", "receiver": member_target["name"]})}
+        if contains(node["name"], "."):
             let pieces = split(node["name"], ".")
             if len(pieces) == 2:
                 return {"error": none, "instructions": append(lowered_value["instructions"], {"field": trim(pieces[1]), "op": "field_store", "receiver": trim(pieces[0])})}
@@ -459,11 +768,21 @@ export fn lower_typed_ir(ir):
     for node in ir["ir"]["nodes"]:
         let lowering_node = node
         if node["kind"] == "while":
-            lowering_node = {"body": node["body"], "condition": node["condition"], "kind": "while", "loop_start": len(instructions)}
-        let lowered = lower_node(lowering_node)
+            lowering_node = {"body": node["body"], "condition": node["condition"], "kind": "while", "loop_start": 0}
+        if node["kind"] == "for":
+            lowering_node = {"binding": node["binding"], "body": node["body"], "iterable": node["iterable"], "kind": "for", "loop_start": len(instructions), "span": node["span"]}
+        let lowered = none
+        if node["kind"] == "function":
+            lowered = lower_function_node(node, instructions)
+        else:
+            if node["kind"] == "class":
+                lowered = lower_class_node(node, instructions)
+            else:
+                lowered = lower_node(lowering_node)
         if lowered["error"] != none:
             return {"error": lowered["error"], "instructions": []}
-        for instruction in lowered["instructions"]:
+        let rebased = b3_rebase_targets(lowered["instructions"], len(instructions))
+        for instruction in rebased:
             instructions = append(instructions, instruction)
     let final_instructions = append(instructions, {"op": "halt"})
     return {"error": none, "instructions": final_instructions, "kind": "zap.bytecode", "schema_version": 1}

@@ -89,31 +89,41 @@ export fn lower_ast_loop_statements(statements, loop_start):
     return {"error": none, "instructions": instructions}
 
 export fn lower_ast_for_node(node):
-    if node["iterable"]["kind"] != "list":
-        return {"error": "unsupported_ast_for_iterable", "instructions": []}
-    let chunks = []
-    for element in node["iterable"]["elements"]:
-        let lowered_element = lower_expression(element)
-        if lowered_element["error"] != none:
-            return lowered_element
-        let body = lower_ast_loop_statements(node["body"]["statements"], 0)
-        if body["error"] != none:
-            return body
-        let chunk = lowered_element["instructions"]
-        chunk = append(chunk, {"name": node["binding"], "op": "store"})
-        for instruction in body["instructions"]:
-            chunk = append(chunk, instruction)
-        chunks = append(chunks, chunk)
-    let instructions = []
-    let offset = 0
-    for chunk in chunks:
-        let next_offset = offset + len(chunk)
-        let patched = patch_continue_jumps(chunk, next_offset)
-        let rebased = lower_rebase_targets(patched, offset)
-        for instruction in rebased:
-            instructions = append(instructions, instruction)
-        offset = next_offset
-    instructions = patch_breaks(instructions, len(instructions))
+    let iterable = lower_expression(node["iterable"])
+    if iterable["error"] != none:
+        return iterable
+    let marker = "__zap_for_" + str(node["span"]["line"]) + "_" + str(node["span"]["column"])
+    let iterator_name = marker + "_iter"
+    let index_name = marker + "_index"
+    let instructions = iterable["instructions"]
+    instructions = append(instructions, {"name": iterator_name, "op": "store"})
+    instructions = append(instructions, {"op": "const", "value": 0})
+    instructions = append(instructions, {"name": index_name, "op": "store"})
+    let loop_start = len(instructions)
+    instructions = append(instructions, {"name": index_name, "op": "load"})
+    instructions = append(instructions, {"name": iterator_name, "op": "load"})
+    instructions = append(instructions, {"op": "iter_length"})
+    instructions = append(instructions, {"op": "less"})
+    let false_jump = len(instructions)
+    instructions = append(instructions, {"op": "jump_if_false", "target": 0})
+    instructions = append(instructions, {"name": iterator_name, "op": "load"})
+    instructions = append(instructions, {"name": index_name, "op": "load"})
+    instructions = append(instructions, {"op": "iter_get"})
+    instructions = append(instructions, {"name": node["binding"], "op": "store"})
+    let body = lower_ast_loop_statements(node["body"]["statements"], loop_start)
+    if body["error"] != none:
+        return body
+    for instruction in body["instructions"]:
+        instructions = append(instructions, instruction)
+    instructions = append(instructions, {"name": index_name, "op": "load"})
+    instructions = append(instructions, {"op": "const", "value": 1})
+    instructions = append(instructions, {"op": "add"})
+    instructions = append(instructions, {"name": index_name, "op": "store"})
+    instructions = append(instructions, {"op": "jump", "target": loop_start})
+    let end_target = len(instructions)
+    instructions = patch_ast_jump(instructions, false_jump, end_target)
+    instructions = patch_breaks(instructions, end_target)
+    instructions = patch_continue_jumps(instructions, loop_start)
     return {"error": none, "instructions": instructions}
 
 export fn lower_ast_try_node(node):
@@ -250,6 +260,19 @@ export fn lower_ast_function_node_owned(node, prefix, binding):
 
 export fn lower_ast_node(node):
     let kind = node["kind"]
+    if kind == "import":
+        let symbols = []
+        if contains(json(node), "\"symbols\""):
+            symbols = node["symbols"]
+        if contains(json(node), "\"alias\"") and node["alias"] != none:
+            if contains(json(node), "\"module_path\""):
+                return {"error": none, "instructions": [{"module_path": node["module_path"], "name": node["alias"], "op": "module_alias", "symbols": symbols}]}
+            return {"error": none, "instructions": [{"name": node["alias"], "op": "module_alias", "symbols": symbols}]}
+        if contains(json(node), "\"module_path\""):
+            return {"error": none, "instructions": [{"module_path": node["module_path"], "op": "module_import", "symbols": symbols}]}
+        return {"error": none, "instructions": []}
+    if kind == "module" or kind == "type_alias" or kind == "trait_use":
+        return {"error": none, "instructions": []}
     if kind == "function":
         return lower_ast_function_node_owned(node, [], none)
     if kind == "class":
@@ -286,11 +309,35 @@ export fn lower_ast_node(node):
         instructions = patch_breaks(instructions, end_target)
         instructions = patch_continue_jumps(instructions, 0)
         return {"error": none, "instructions": instructions}
-    if kind == "declaration" or kind == "assignment":
+    if kind == "declaration":
         let lowered_value = lower_expression(node["value"])
         if lowered_value["error"] != none:
             return lowered_value
-        if kind == "assignment" and contains(node["name"], "."):
+        return {"error": none, "instructions": append(lowered_value["instructions"], {"op": "store", "name": node["name"]})}
+    if kind == "assignment":
+        let lowered_value = lower_expression(node["value"])
+        if lowered_value["error"] != none:
+            return lowered_value
+        if contains(json(node), "\"target\"") and node["target"] != none:
+            let target = node["target"]
+            if target["kind"] == "index":
+                let lowered_target = lower_expression(target["target"])
+                if lowered_target["error"] != none:
+                    return lowered_target
+                let lowered_index = lower_expression(target["index"])
+                if lowered_index["error"] != none:
+                    return lowered_index
+                let instructions = lowered_target["instructions"]
+                for item in lowered_index["instructions"]:
+                    instructions = append(instructions, item)
+                for item in lowered_value["instructions"]:
+                    instructions = append(instructions, item)
+                return {"error": none, "instructions": append(instructions, {"op": "index_store", "receiver": target["target"]["name"]})}
+            if target["kind"] == "member":
+                let member_target = target["target"]
+                if member_target["kind"] == "name":
+                    return {"error": none, "instructions": append(lowered_value["instructions"], {"field": target["member"], "op": "field_store", "receiver": member_target["name"]})}
+        if contains(node["name"], "."):
             let pieces = split(node["name"], ".")
             if len(pieces) == 2:
                 return {"error": none, "instructions": append(lowered_value["instructions"], {"field": trim(pieces[1]), "op": "field_store", "receiver": trim(pieces[0])})}
